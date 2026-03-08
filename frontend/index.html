@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Agent</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>AI Voice Agent</h1>
+            <p class="subtitle">Speak naturally with AI</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Status Indicator -->
+            <div class="status-panel">
+                <div class="status-indicator" id="statusIndicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span class="status-text" id="statusText">Ready to connect</span>
+                </div>
+            </div>
+
+            <!-- Conversation Area -->
+            <div class="conversation-area">
+                <div class="conversation-header">
+                    <h2>Conversation</h2>
+                    <button class="btn-clear" id="btnClear">Clear</button>
+                </div>
+                <div class="conversation-transcript" id="transcript">
+                    <div class="welcome-message">
+                        <p>Click "Start Conversation" to begin speaking with the AI.</p>
+                        <p class="help-text">Make sure your microphone is ready!</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Phone Dialer Panel -->
+            <div class="dialer-panel" id="dialerPanel">
+                <div class="dialer-header">
+                    <h2>Phone Dialer</h2>
+                    <span class="dialer-subtitle">Call via Twilio AI Agent</span>
+                </div>
+                <div class="dialer-input-row">
+                    <input type="tel" id="phoneInput" class="phone-input" placeholder="+1 (555) 123-4567" />
+                    <button class="btn-call" id="btnCall">
+                        <span class="btn-icon">📞</span>
+                        <span class="btn-text">Call</span>
+                    </button>
+                    <button class="btn-hangup hidden" id="btnHangup">
+                        <span class="btn-icon">📵</span>
+                        <span class="btn-text">Hang Up</span>
+                    </button>
+                </div>
+                <div class="dialer-options">
+                    <label class="toggle-label" for="toggleElevenLabs">
+                        <span class="toggle-switch">
+                            <input type="checkbox" id="toggleElevenLabs" />
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="toggle-text">ElevenLabs Voice</span>
+                        <span class="toggle-hint" id="voiceHint">(Using OpenAI built-in voice)</span>
+                    </label>
+                </div>
+                <div class="call-status hidden" id="callStatus">
+                    <div class="call-status-dot"></div>
+                    <span class="call-status-text" id="callStatusText">Calling...</span>
+                </div>
+            </div>
+
+            <div class="section-divider">
+                <span>OR</span>
+            </div>
+
+            <!-- Control Panel (browser mic) -->
+            <div class="control-panel">
+                <button class="btn-primary btn-large" id="btnStartStop">
+                    <span class="btn-icon" id="btnIcon">🎤</span>
+                    <span class="btn-text" id="btnText">Start Browser Conversation</span>
+                </button>
+
+                <button class="btn-secondary btn-interrupt hidden" id="btnInterrupt">
+                    <span class="btn-icon">🤚</span>
+                    <span class="btn-text">Stop AI</span>
+                </button>
+
+                <div class="volume-indicator" id="volumeIndicator">
+                    <div class="volume-bars">
+                        <div class="volume-bar"></div>
+                        <div class="volume-bar"></div>
+                        <div class="volume-bar"></div>
+                        <div class="volume-bar"></div>
+                        <div class="volume-bar"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Summary Panel (hidden by default) -->
+            <div class="summary-panel hidden" id="summaryPanel">
+                <div class="summary-header">
+                    <h2>Conversation Summary</h2>
+                    <button class="btn-close" id="btnCloseSummary">×</button>
+                </div>
+                <div class="summary-content" id="summaryContent">
+                    <!-- Summary will be dynamically inserted here -->
+                </div>
+            </div>
+
+            <!-- Settings (collapsible) -->
+            <details class="settings-panel">
+                <summary>Settings</summary>
+                <div class="settings-content">
+                    <div class="setting-item">
+                        <label for="voiceSelect">Voice:</label>
+                        <select id="voiceSelect">
+                            <option value="alloy" selected>Alloy (Neutral)</option>
+                            <option value="echo">Echo (Male)</option>
+                            <option value="fable">Fable (British)</option>
+                            <option value="onyx">Onyx (Deep)</option>
+                            <option value="nova">Nova (Female)</option>
+                            <option value="shimmer">Shimmer (Soft)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label for="vadThreshold">Silence Threshold:</label>
+                        <input type="range" id="vadThreshold" min="0.5" max="3" step="0.1" value="1.5">
+                        <span id="vadThresholdValue">1.5s</span>
+                    </div>
+                </div>
+            </details>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Powered by Twilio • OpenAI • ElevenLabs • GPT-4o</p>
+        </footer>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay hidden" id="loadingOverlay">
+        <div class="loading-spinner"></div>
+        <p class="loading-text">Processing...</p>
+    </div>
+
+    <!-- Error Toast -->
+    <div class="error-toast hidden" id="errorToast">
+        <span class="error-icon">⚠️</span>
+        <span class="error-message" id="errorMessage"></span>
+    </div>
+
+    <!-- Scripts -->
+    <script src="/static/js/websocket-client.js?v=7"></script>
+    <script src="/static/js/audio-recorder.js?v=7"></script>
+    <script src="/static/js/audio-player.js?v=7"></script>
+    <script src="/static/js/main.js?v=7"></script>
+</body>
+</html>
