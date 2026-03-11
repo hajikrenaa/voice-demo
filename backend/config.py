@@ -20,6 +20,10 @@ class Config:
     ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
     ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
 
+    # Login Credentials (single user)
+    LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin")
+    LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "admin123")
+
     # Server URL (public URL for Twilio webhooks)
     SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000")
 
@@ -55,7 +59,7 @@ class Config:
 
     # OpenAI Realtime API Configuration (for ultra-low latency)
     REALTIME_MODEL = "gpt-4o-mini-realtime-preview"
-    REALTIME_VOICE = "alloy"  # Options: alloy, echo, fable, onyx, nova, shimmer
+    REALTIME_VOICE = "coral"  # Warm, clear, works well with Indian English phrasing
     REALTIME_AUDIO_FORMAT = "pcm16"  # 24kHz, mono, 16-bit PCM
 
     # Twilio Audio Settings

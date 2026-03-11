@@ -10,6 +10,7 @@ let audioPlayer = null;
 let isConversationActive = false;
 let isAISpeaking = false;  // Track if AI is currently speaking
 let useRealtimeAPI = true;  // Enable Realtime API for ultra-low latency (default: true)
+let authToken = localStorage.getItem('authToken') || null;
 
 // UI Elements
 let btnStartStop, btnClear, btnCloseSummary, btnInterrupt;
@@ -21,11 +22,116 @@ let voiceSelect, vadThreshold, vadThresholdValue;
 let currentCallSid = null;
 
 /**
+ * Authenticated fetch wrapper — adds Authorization header automatically
+ */
+function authFetch(url, options = {}) {
+    if (!options.headers) options.headers = {};
+    if (authToken) {
+        options.headers['Authorization'] = 'Bearer ' + authToken;
+    }
+    return fetch(url, options);
+}
+
+/**
  * Initialize the application
  */
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('Initializing AI Voice Agent...');
 
+    // Set up login form handler
+    setupLoginHandler();
+
+    // Check if already authenticated
+    if (authToken) {
+        try {
+            const res = await authFetch('/api/auth/check');
+            if (res.ok) {
+                showApp();
+            } else {
+                authToken = null;
+                localStorage.removeItem('authToken');
+                showLogin();
+                return;
+            }
+        } catch (e) {
+            showLogin();
+            return;
+        }
+    } else {
+        showLogin();
+        return;
+    }
+
+    // Initialize app after auth
+    initApp();
+});
+
+/**
+ * Show login overlay, hide app
+ */
+function showLogin() {
+    document.getElementById('loginOverlay').classList.remove('hidden');
+    document.getElementById('appContainer').classList.add('hidden');
+}
+
+/**
+ * Show app, hide login overlay
+ */
+function showApp() {
+    document.getElementById('loginOverlay').classList.add('hidden');
+    document.getElementById('appContainer').classList.remove('hidden');
+}
+
+/**
+ * Set up login form submission
+ */
+function setupLoginHandler() {
+    const form = document.getElementById('loginForm');
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const username = document.getElementById('loginUsername').value.trim();
+        const password = document.getElementById('loginPassword').value;
+        const errorDiv = document.getElementById('loginError');
+        const btnLogin = document.getElementById('btnLogin');
+
+        if (!username || !password) return;
+
+        btnLogin.disabled = true;
+        btnLogin.textContent = 'Signing in...';
+        errorDiv.classList.add('hidden');
+
+        try {
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const data = await res.json();
+
+            if (data.success && data.token) {
+                authToken = data.token;
+                localStorage.setItem('authToken', authToken);
+                showApp();
+                initApp();
+            } else {
+                errorDiv.textContent = data.error || 'Invalid username or password';
+                errorDiv.classList.remove('hidden');
+            }
+        } catch (err) {
+            errorDiv.textContent = 'Connection error. Please try again.';
+            errorDiv.classList.remove('hidden');
+        } finally {
+            btnLogin.disabled = false;
+            btnLogin.textContent = 'Sign In';
+        }
+    });
+}
+
+/**
+ * Initialize the main app (called after successful auth)
+ */
+function initApp() {
     // Get UI elements
     initializeUIElements();
 
@@ -44,7 +150,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupUIHandlers();
 
     console.log('Application initialized');
-});
+}
 
 /**
  * Initialize UI element references
@@ -144,6 +250,416 @@ function setupUIHandlers() {
                 : '(Using OpenAI built-in voice)';
         });
     }
+
+    // --- Agent Config: Questions add/remove ---
+    document.getElementById('btnAddQuestion').addEventListener('click', addQuestion);
+    document.getElementById('questionsList').addEventListener('click', (e) => {
+        if (e.target.classList.contains('btn-remove-q')) {
+            const item = e.target.closest('.question-item');
+            if (item && document.querySelectorAll('.question-item').length > 1) {
+                item.remove();
+            }
+        }
+    });
+
+    // --- Script save / activate / deactivate ---
+    document.getElementById('btnSaveScript').addEventListener('click', saveScript);
+    document.getElementById('btnActivateScript').addEventListener('click', activateScript);
+    document.getElementById('btnDeactivateScript').addEventListener('click', deactivateScript);
+
+    // --- Logout ---
+    document.getElementById('btnLogout').addEventListener('click', async () => {
+        try {
+            await authFetch('/api/logout', { method: 'POST' });
+        } catch (e) { /* ignore */ }
+        authToken = null;
+        localStorage.removeItem('authToken');
+        showLogin();
+    });
+
+    // --- API Settings ---
+    document.getElementById('btnSaveSettings').addEventListener('click', saveApiSettings);
+    // Load settings when the panel is opened
+    document.getElementById('apiSettingsPanel').addEventListener('toggle', (e) => {
+        if (e.target.open) loadApiSettings();
+    });
+
+    // Load saved scripts and check active status on page load
+    loadSavedScripts();
+    checkScriptStatus();
+}
+
+/**
+ * Toggle password field visibility
+ */
+function toggleKeyVisibility(btn) {
+    const input = btn.parentElement.querySelector('input');
+    if (input.type === 'password') {
+        input.type = 'text';
+        btn.textContent = 'Hide';
+    } else {
+        input.type = 'password';
+        btn.textContent = 'Show';
+    }
+}
+
+/**
+ * Load API settings from server into the form
+ */
+async function loadApiSettings() {
+    try {
+        const res = await authFetch('/api/settings');
+        if (!res.ok) return;
+        const data = await res.json();
+        const settings = data.settings || {};
+
+        // Fill each input that has a data-key attribute
+        document.querySelectorAll('.api-key-input[data-key]').forEach(input => {
+            const key = input.dataset.key;
+            if (settings[key]) {
+                input.value = settings[key].value || '';
+                input.placeholder = settings[key].masked ? 'Enter new value to update' : '';
+            }
+        });
+    } catch (e) {
+        console.error('Failed to load settings:', e);
+    }
+}
+
+/**
+ * Save API settings to server
+ */
+async function saveApiSettings() {
+    const btn = document.getElementById('btnSaveSettings');
+    const statusEl = document.getElementById('saveStatus');
+    const updates = {};
+
+    // Collect all non-empty inputs
+    document.querySelectorAll('.api-key-input[data-key]').forEach(input => {
+        const key = input.dataset.key;
+        const val = input.value.trim();
+        // Only send if value is present and not a masked placeholder
+        if (val && !val.includes('****')) {
+            updates[key] = val;
+        }
+    });
+
+    if (Object.keys(updates).length === 0) {
+        statusEl.textContent = 'No changes to save';
+        statusEl.className = 'save-status error';
+        statusEl.classList.remove('hidden');
+        setTimeout(() => statusEl.classList.add('hidden'), 3000);
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    statusEl.classList.add('hidden');
+
+    try {
+        const res = await authFetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ settings: updates })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            statusEl.textContent = `Saved! Updated: ${data.updated.join(', ')}`;
+            statusEl.className = 'save-status';
+            statusEl.classList.remove('hidden');
+            // Reload to show masked values
+            await loadApiSettings();
+        } else {
+            statusEl.textContent = data.error || 'Save failed';
+            statusEl.className = 'save-status error';
+            statusEl.classList.remove('hidden');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.className = 'save-status error';
+        statusEl.classList.remove('hidden');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Save All Changes';
+        setTimeout(() => statusEl.classList.add('hidden'), 5000);
+    }
+}
+
+/**
+ * Add a new blank question input
+ */
+function addQuestion() {
+    const list = document.getElementById('questionsList');
+    const item = document.createElement('div');
+    item.className = 'question-item';
+    item.innerHTML = `
+        <input type="text" class="question-input" placeholder="Enter a question..." />
+        <button class="btn-remove-q" title="Remove">&times;</button>
+    `;
+    list.appendChild(item);
+    item.querySelector('input').focus();
+}
+
+/**
+ * Collect script config from the UI
+ */
+function getScriptConfig() {
+    const welcome = document.getElementById('welcomeMessage').value.trim();
+    const goal = document.getElementById('agentGoal').value.trim();
+    const behaviour = document.getElementById('agentBehaviour').value.trim();
+
+    const questions = [];
+    document.querySelectorAll('.question-input').forEach(input => {
+        const q = input.value.trim();
+        if (q) questions.push(q);
+    });
+
+    return { welcome, questions, goal, behaviour };
+}
+
+/**
+ * Activate the current script on the server
+ */
+async function activateScript() {
+    const script = getScriptConfig();
+    if (!script.welcome && script.questions.length === 0) {
+        showError('Please add a welcome message or at least one question');
+        return;
+    }
+    try {
+        const res = await authFetch('/api/script/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(script)
+        });
+        const data = await res.json();
+        if (data.success) {
+            updateScriptStatusUI(true);
+        }
+    } catch (e) {
+        showError('Failed to activate script');
+    }
+}
+
+/**
+ * Deactivate the script on the server
+ */
+async function deactivateScript() {
+    try {
+        const res = await authFetch('/api/script/deactivate', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+            updateScriptStatusUI(false);
+        }
+    } catch (e) {
+        showError('Failed to deactivate script');
+    }
+}
+
+/**
+ * Check script status on page load
+ */
+async function checkScriptStatus() {
+    try {
+        const res = await authFetch('/api/script/status');
+        const data = await res.json();
+        updateScriptStatusUI(data.active);
+        if (data.active && data.script) {
+            _activeScriptId = data.script.id || null;
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+/**
+ * Update the script status UI
+ */
+function updateScriptStatusUI(active) {
+    const bar = document.getElementById('scriptStatusBar');
+    const label = document.getElementById('scriptStatusLabel');
+    const btnActivate = document.getElementById('btnActivateScript');
+    const btnDeactivate = document.getElementById('btnDeactivateScript');
+
+    if (active) {
+        bar.classList.add('active');
+        label.textContent = 'Script is ACTIVE — calls will use this script';
+        btnActivate.classList.add('hidden');
+        btnDeactivate.classList.remove('hidden');
+    } else {
+        bar.classList.remove('active');
+        label.textContent = 'No script active — using default prompt';
+        btnActivate.classList.remove('hidden');
+        btnDeactivate.classList.add('hidden');
+    }
+}
+
+// ==========================================
+// Saved Scripts Management
+// ==========================================
+
+let _activeScriptId = null;
+
+/**
+ * Save current script to server
+ */
+async function saveScript() {
+    const script = getScriptConfig();
+    if (!script.welcome && script.questions.length === 0) {
+        showError('Add a welcome message or questions before saving');
+        return;
+    }
+    const name = prompt('Script name:', script.welcome.substring(0, 40) || 'My Script');
+    if (!name) return;
+
+    try {
+        const res = await authFetch('/api/scripts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...script, name })
+        });
+        const data = await res.json();
+        if (data.success) {
+            loadSavedScripts();
+        }
+    } catch (e) {
+        showError('Failed to save script');
+    }
+}
+
+/**
+ * Load all saved scripts from server
+ */
+async function loadSavedScripts() {
+    try {
+        const res = await authFetch('/api/scripts');
+        const scripts = await res.json();
+        renderSavedScripts(scripts);
+    } catch (e) {
+        // ignore
+    }
+}
+
+/**
+ * Render saved scripts list
+ */
+function renderSavedScripts(scripts) {
+    const list = document.getElementById('savedScriptsList');
+    const msg = document.getElementById('noScriptsMsg');
+
+    if (!scripts || scripts.length === 0) {
+        list.innerHTML = '<p class="no-scripts-msg" id="noScriptsMsg">No saved scripts yet. Create one above and click Save.</p>';
+        return;
+    }
+
+    list.innerHTML = scripts.map(s => `
+        <div class="saved-script-card ${s.id === _activeScriptId ? 'active-card' : ''}" data-id="${s.id}">
+            <div class="saved-script-info" onclick="loadScriptToEditor('${s.id}')">
+                <div class="saved-script-name">${escapeHtml(s.name)}</div>
+                <div class="saved-script-meta">${s.questions ? s.questions.length : 0} questions</div>
+            </div>
+            <div class="saved-script-actions">
+                <button class="btn-load-script" onclick="loadScriptToEditor('${s.id}')">Load</button>
+                <button class="btn-use-script" onclick="activateSavedScript('${s.id}')">Use</button>
+                <button class="btn-delete-script" onclick="deleteSavedScript('${s.id}')">Delete</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+/**
+ * Load a saved script into the editor fields
+ */
+async function loadScriptToEditor(scriptId) {
+    try {
+        const res = await authFetch('/api/scripts');
+        const scripts = await res.json();
+        const s = scripts.find(x => x.id === scriptId);
+        if (!s) return;
+
+        document.getElementById('welcomeMessage').value = s.welcome || '';
+        document.getElementById('agentGoal').value = s.goal || '';
+        document.getElementById('agentBehaviour').value = s.behaviour || '';
+
+        // Rebuild questions list
+        const qList = document.getElementById('questionsList');
+        qList.innerHTML = '';
+        const questions = s.questions && s.questions.length > 0 ? s.questions : [''];
+        questions.forEach(q => {
+            const item = document.createElement('div');
+            item.className = 'question-item';
+            item.innerHTML = `
+                <input type="text" class="question-input" value="${escapeHtml(q)}" />
+                <button class="btn-remove-q" title="Remove">&times;</button>
+            `;
+            qList.appendChild(item);
+        });
+    } catch (e) {
+        showError('Failed to load script');
+    }
+}
+
+/**
+ * Activate a saved script directly (load + activate in one click)
+ */
+async function activateSavedScript(scriptId) {
+    try {
+        const res = await authFetch('/api/scripts');
+        const scripts = await res.json();
+        const s = scripts.find(x => x.id === scriptId);
+        if (!s) return;
+
+        const payload = {
+            id: s.id,
+            welcome: s.welcome,
+            questions: s.questions,
+            goal: s.goal,
+            behaviour: s.behaviour
+        };
+
+        const actRes = await authFetch('/api/script/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await actRes.json();
+        if (data.success) {
+            _activeScriptId = scriptId;
+            updateScriptStatusUI(true);
+            loadSavedScripts();
+            // Also load into editor
+            await loadScriptToEditor(scriptId);
+        }
+    } catch (e) {
+        showError('Failed to activate script');
+    }
+}
+
+/**
+ * Delete a saved script
+ */
+async function deleteSavedScript(scriptId) {
+    if (!confirm('Delete this script?')) return;
+    try {
+        await authFetch(`/api/scripts/${scriptId}`, { method: 'DELETE' });
+        if (_activeScriptId === scriptId) {
+            _activeScriptId = null;
+            updateScriptStatusUI(false);
+        }
+        loadSavedScripts();
+    } catch (e) {
+        showError('Failed to delete script');
+    }
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text || '';
+    return div.innerHTML;
 }
 
 /**
@@ -722,7 +1238,7 @@ async function makeOutboundCall() {
         callStatus.classList.remove('error');
         callStatusText.textContent = `Calling ${dialNumber}...`;
 
-        const response = await fetch('/twilio/outbound-call', {
+        const response = await authFetch('/twilio/outbound-call', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ to: dialNumber, elevenlabs: useElevenLabs })
@@ -759,7 +1275,7 @@ async function hangupCall() {
     try {
         callStatusText.textContent = 'Hanging up...';
 
-        const response = await fetch('/twilio/hangup', {
+        const response = await authFetch('/twilio/hangup', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ call_sid: currentCallSid })

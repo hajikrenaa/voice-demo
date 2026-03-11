@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Cookie, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -7,6 +7,9 @@ import logging
 import sys
 import asyncio
 import json
+import uuid
+import hashlib
+import secrets
 from pathlib import Path
 
 # Import services
@@ -24,6 +27,31 @@ from utils.audio_processing import (
     validate_audio
 )
 from config import Config
+
+# Active sessions — maps session tokens to True
+_active_sessions: set[str] = set()
+
+# Active script — set via /api/script/activate, used by all outbound calls
+_active_script: dict | None = None
+
+# Scripts storage file
+SCRIPTS_FILE = Path(__file__).parent / "data" / "scripts.json"
+
+
+def _load_scripts() -> list:
+    """Load saved scripts from disk."""
+    try:
+        if SCRIPTS_FILE.exists():
+            return json.loads(SCRIPTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def _save_scripts(scripts: list):
+    """Save scripts to disk."""
+    SCRIPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SCRIPTS_FILE.write_text(json.dumps(scripts, indent=2), encoding="utf-8")
 
 # Configure logging
 logging.basicConfig(
@@ -113,6 +141,280 @@ async def get_config():
 
 
 # ==========================================
+# Authentication
+# ==========================================
+
+def _verify_token(token: str | None) -> bool:
+    """Check if a session token is valid."""
+    return token is not None and token in _active_sessions
+
+
+async def require_auth(request: Request):
+    """Dependency that checks for a valid session token in the Authorization header."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not _verify_token(token):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    """Authenticate the single user and return a session token."""
+    body = await request.json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if username == Config.LOGIN_USERNAME and password == Config.LOGIN_PASSWORD:
+        token = secrets.token_hex(32)
+        _active_sessions.add(token)
+        logger.info(f"User '{username}' logged in")
+        return JSONResponse({"success": True, "token": token})
+
+    logger.warning(f"Failed login attempt for user '{username}'")
+    return JSONResponse({"success": False, "error": "Invalid username or password"}, status_code=401)
+
+
+@app.get("/api/auth/check")
+async def auth_check(request: Request):
+    """Check if the current session token is still valid."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if _verify_token(token):
+        return JSONResponse({"authenticated": True})
+    return JSONResponse({"authenticated": False}, status_code=401)
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    """Invalidate the session token."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    _active_sessions.discard(token)
+    return JSONResponse({"success": True})
+
+
+# ==========================================
+# Settings / API Keys Management
+# ==========================================
+
+ENV_FILE = Path(__file__).parent / ".env"
+
+# Keys that can be read and updated from the UI
+_EDITABLE_KEYS = [
+    "OPENAI_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_VOICE_ID",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_PHONE_NUMBER",
+    "SERVER_URL",
+    "LOGIN_USERNAME",
+    "LOGIN_PASSWORD",
+]
+
+
+def _read_env() -> dict:
+    """Parse the .env file into a dict."""
+    result = {}
+    if not ENV_FILE.exists():
+        return result
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            result[key.strip()] = value.strip()
+    return result
+
+
+def _write_env(values: dict):
+    """Write updated values back to .env, preserving comments and order."""
+    if not ENV_FILE.exists():
+        # Create with all values
+        lines = []
+        for k, v in values.items():
+            lines.append(f"{k}={v}")
+        ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    original_lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    updated_keys = set()
+    new_lines = []
+
+    for line in original_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in values:
+                new_lines.append(f"{key}={values[key]}")
+                updated_keys.add(key)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    # Append any new keys not already in the file
+    for k, v in values.items():
+        if k not in updated_keys:
+            new_lines.append(f"{k}={v}")
+
+    ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def _mask_key(value: str) -> str:
+    """Mask a secret key for display — show first 6 and last 4 chars."""
+    if not value or len(value) <= 12:
+        return value
+    return value[:6] + "*" * (len(value) - 10) + value[-4:]
+
+
+@app.get("/api/settings")
+async def get_settings(request: Request):
+    """Return current settings with masked secrets."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not _verify_token(token):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    env = _read_env()
+    # Build response — mask secret keys, show others in full
+    secret_keys = {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "TWILIO_AUTH_TOKEN", "LOGIN_PASSWORD"}
+    settings = {}
+    for key in _EDITABLE_KEYS:
+        raw = env.get(key, "")
+        settings[key] = {
+            "value": _mask_key(raw) if key in secret_keys else raw,
+            "masked": key in secret_keys,
+        }
+
+    return JSONResponse({"success": True, "settings": settings})
+
+
+@app.put("/api/settings")
+async def update_settings(request: Request):
+    """Update one or more settings in the .env file and reload Config."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not _verify_token(token):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    body = await request.json()
+    updates = body.get("settings", {})
+
+    if not updates:
+        return JSONResponse({"error": "No settings provided"}, status_code=400)
+
+    # Only allow editable keys
+    filtered = {}
+    for key, value in updates.items():
+        if key in _EDITABLE_KEYS and isinstance(value, str) and value.strip():
+            filtered[key] = value.strip()
+
+    if not filtered:
+        return JSONResponse({"error": "No valid settings to update"}, status_code=400)
+
+    # Read current env, merge, write back
+    env = _read_env()
+    env.update(filtered)
+    _write_env(env)
+
+    # Reload Config class attributes from updated values
+    for key, value in filtered.items():
+        if hasattr(Config, key):
+            setattr(Config, key, value)
+        os.environ[key] = value
+
+    logger.info(f"Settings updated: {list(filtered.keys())}")
+    return JSONResponse({"success": True, "updated": list(filtered.keys())})
+
+
+# ==========================================
+# Script Management Endpoints
+# ==========================================
+
+@app.post("/api/script/activate")
+async def activate_script(request: Request):
+    """Activate a script so all outbound calls use it."""
+    global _active_script
+    body = await request.json()
+    _active_script = body
+    logger.info(f"Script activated: welcome='{body.get('welcome', '')[:40]}', {len(body.get('questions', []))} questions")
+    return JSONResponse({"success": True, "active": True})
+
+
+@app.post("/api/script/deactivate")
+async def deactivate_script():
+    """Deactivate the current script — calls use default prompt."""
+    global _active_script
+    _active_script = None
+    logger.info("Script deactivated")
+    return JSONResponse({"success": True, "active": False})
+
+
+@app.get("/api/script/status")
+async def script_status():
+    """Check if a script is currently active."""
+    return JSONResponse({
+        "active": _active_script is not None,
+        "script": _active_script
+    })
+
+
+# ==========================================
+# Saved Scripts CRUD
+# ==========================================
+
+@app.get("/api/scripts")
+async def list_scripts():
+    """List all saved scripts."""
+    return JSONResponse(_load_scripts())
+
+
+@app.post("/api/scripts")
+async def save_script(request: Request):
+    """Save a new script (or update existing by id)."""
+    body = await request.json()
+    scripts = _load_scripts()
+
+    script_id = body.get("id") or str(uuid.uuid4())[:8]
+    name = body.get("name") or body.get("welcome", "Untitled")[:40]
+
+    # Check if updating existing
+    existing = next((i for i, s in enumerate(scripts) if s["id"] == script_id), None)
+
+    script_obj = {
+        "id": script_id,
+        "name": name,
+        "welcome": body.get("welcome", ""),
+        "questions": body.get("questions", []),
+        "goal": body.get("goal", ""),
+        "behaviour": body.get("behaviour", ""),
+    }
+
+    if existing is not None:
+        scripts[existing] = script_obj
+    else:
+        scripts.append(script_obj)
+
+    _save_scripts(scripts)
+    logger.info(f"Script saved: {script_id} — {name}")
+    return JSONResponse({"success": True, "script": script_obj})
+
+
+@app.delete("/api/scripts/{script_id}")
+async def delete_script(script_id: str):
+    """Delete a saved script."""
+    global _active_script
+    scripts = _load_scripts()
+    scripts = [s for s in scripts if s["id"] != script_id]
+    _save_scripts(scripts)
+
+    # Deactivate if this was the active script
+    if _active_script and _active_script.get("id") == script_id:
+        _active_script = None
+
+    logger.info(f"Script deleted: {script_id}")
+    return JSONResponse({"success": True})
+
+
+# ==========================================
 # Twilio Voice Calling Endpoints
 # ==========================================
 
@@ -125,7 +427,6 @@ async def twilio_voice_webhook(request: Request):
     server_url = Config.SERVER_URL
     ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://")
 
-    # Check for elevenlabs param (passed from outbound call URL)
     use_elevenlabs = request.query_params.get("elevenlabs", "false")
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -138,7 +439,7 @@ async def twilio_voice_webhook(request: Request):
     </Connect>
 </Response>"""
 
-    logger.info(f"Twilio voice webhook called - streaming to {ws_url}/ws/twilio-stream")
+    logger.info(f"Twilio voice webhook called, script_active={_active_script is not None}")
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -163,7 +464,8 @@ async def make_outbound_call(request: Request):
 
         client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
 
-        voice_url = f"{Config.SERVER_URL}/twilio/voice?elevenlabs={'true' if use_elevenlabs else 'false'}"
+        el = 'true' if use_elevenlabs else 'false'
+        voice_url = f"{Config.SERVER_URL}/twilio/voice?elevenlabs={el}"
         call = client.calls.create(
             to=to_number,
             from_=Config.TWILIO_PHONE_NUMBER,
@@ -221,9 +523,7 @@ async def twilio_media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream WebSocket connected")
 
-    # ElevenLabs flag comes via Twilio <Parameter> in the "start" event
-    # We create handler later after reading the start event
-    handler = TwilioRealtimeHandler(use_elevenlabs=False)
+    handler = TwilioRealtimeHandler(active_script=_active_script)
 
     try:
         async for raw_message in websocket.iter_text():

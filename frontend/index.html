@@ -4,13 +4,38 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Voice Agent</title>
-    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/styles.css?v=11">
 </head>
 <body>
-    <div class="container">
+    <!-- Login Overlay -->
+    <div class="login-overlay" id="loginOverlay">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>AI Voice Agent</h1>
+                <p>Sign in to continue</p>
+            </div>
+            <form class="login-form" id="loginForm">
+                <div class="login-field">
+                    <label for="loginUsername">Username</label>
+                    <input type="text" id="loginUsername" placeholder="Enter username" autocomplete="username" required />
+                </div>
+                <div class="login-field">
+                    <label for="loginPassword">Password</label>
+                    <input type="password" id="loginPassword" placeholder="Enter password" autocomplete="current-password" required />
+                </div>
+                <div class="login-error hidden" id="loginError">Invalid username or password</div>
+                <button type="submit" class="btn-login" id="btnLogin">Sign In</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="container hidden" id="appContainer">
         <!-- Header -->
         <header class="header">
-            <h1>AI Voice Agent</h1>
+            <div class="header-top">
+                <h1>AI Voice Agent</h1>
+                <button class="btn-logout" id="btnLogout">Logout</button>
+            </div>
             <p class="subtitle">Speak naturally with AI</p>
         </header>
 
@@ -35,6 +60,83 @@
                         <p>Click "Start Conversation" to begin speaking with the AI.</p>
                         <p class="help-text">Make sure your microphone is ready!</p>
                     </div>
+                </div>
+            </div>
+
+            <!-- Agent Configuration -->
+            <div class="agent-config" id="agentConfig">
+                <!-- Script Status Bar -->
+                <div class="script-status-bar" id="scriptStatusBar">
+                    <div class="script-status-info">
+                        <div class="script-status-dot" id="scriptStatusDot"></div>
+                        <span id="scriptStatusLabel">No script active</span>
+                    </div>
+                    <div class="script-actions">
+                        <button class="btn-save-script" id="btnSaveScript">Save</button>
+                        <button class="btn-activate" id="btnActivateScript">Activate</button>
+                        <button class="btn-deactivate hidden" id="btnDeactivateScript">Deactivate</button>
+                    </div>
+                </div>
+
+                <!-- Script Panel -->
+                <div class="config-panel">
+                    <div class="config-panel-header">
+                        <h3>Script</h3>
+                    </div>
+                    <div class="config-field">
+                        <label for="welcomeMessage">Welcome Message</label>
+                        <textarea id="welcomeMessage" rows="2" placeholder="Hi! This is Alex from Company. Am I speaking with the right person?">Hi! This is Alex calling from our team. I hope I'm not catching you at a bad time. I just have a few quick questions for you.</textarea>
+                    </div>
+                    <div class="config-field">
+                        <label>Questions to Ask</label>
+                        <div id="questionsList">
+                            <div class="question-item">
+                                <input type="text" class="question-input" value="May I know who I'm speaking with?" />
+                                <button class="btn-remove-q" title="Remove">&times;</button>
+                            </div>
+                            <div class="question-item">
+                                <input type="text" class="question-input" value="What are you looking for or interested in?" />
+                                <button class="btn-remove-q" title="Remove">&times;</button>
+                            </div>
+                            <div class="question-item">
+                                <input type="text" class="question-input" value="What's the best email or number to reach you?" />
+                                <button class="btn-remove-q" title="Remove">&times;</button>
+                            </div>
+                        </div>
+                        <button class="btn-add-q" id="btnAddQuestion">+ Add Question</button>
+                    </div>
+                </div>
+
+                <!-- Goal Panel -->
+                <div class="config-panel">
+                    <div class="config-panel-header">
+                        <h3>Goal</h3>
+                    </div>
+                    <div class="config-field">
+                        <label for="agentGoal">Final Outcome</label>
+                        <textarea id="agentGoal" rows="2" placeholder="What should the agent achieve?">Collect the person's name, reason for interest, and best contact details. Confirm all collected info before ending the call politely.</textarea>
+                    </div>
+                </div>
+
+                <!-- Behaviour Panel -->
+                <div class="config-panel">
+                    <div class="config-panel-header">
+                        <h3>Behaviour</h3>
+                    </div>
+                    <div class="config-field">
+                        <label for="agentBehaviour">Agent Personality & Rules</label>
+                        <textarea id="agentBehaviour" rows="2" placeholder="How should the agent behave?">Be warm, polite, and professional. You are the caller — lead the conversation confidently. Listen carefully to answers. Keep replies to 1-2 short sentences. English only.</textarea>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Saved Scripts -->
+            <div class="saved-scripts-panel" id="savedScriptsPanel">
+                <div class="saved-scripts-header">
+                    <h2>Saved Scripts</h2>
+                </div>
+                <div class="saved-scripts-list" id="savedScriptsList">
+                    <p class="no-scripts-msg" id="noScriptsMsg">No saved scripts yet. Create one above and click Save.</p>
                 </div>
             </div>
 
@@ -111,7 +213,7 @@
 
             <!-- Settings (collapsible) -->
             <details class="settings-panel">
-                <summary>Settings</summary>
+                <summary>Voice Settings</summary>
                 <div class="settings-content">
                     <div class="setting-item">
                         <label for="voiceSelect">Voice:</label>
@@ -128,6 +230,95 @@
                         <label for="vadThreshold">Silence Threshold:</label>
                         <input type="range" id="vadThreshold" min="0.5" max="3" step="0.1" value="1.5">
                         <span id="vadThresholdValue">1.5s</span>
+                    </div>
+                </div>
+            </details>
+
+            <!-- API Keys & Configuration Settings -->
+            <details class="settings-panel api-settings-panel" id="apiSettingsPanel">
+                <summary>API Keys & Configuration</summary>
+                <div class="settings-content">
+                    <div class="api-settings-notice">
+                        Update your API keys and configuration here. Changes are saved to the server .env file and take effect immediately.
+                    </div>
+
+                    <!-- OpenAI -->
+                    <div class="api-settings-group">
+                        <h4>OpenAI</h4>
+                        <div class="api-setting-item">
+                            <label for="settingOpenaiKey">API Key</label>
+                            <div class="api-input-row">
+                                <input type="password" id="settingOpenaiKey" data-key="OPENAI_API_KEY" placeholder="sk-..." class="api-key-input" />
+                                <button class="btn-toggle-vis" title="Show/Hide" onclick="toggleKeyVisibility(this)">Show</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ElevenLabs -->
+                    <div class="api-settings-group">
+                        <h4>ElevenLabs</h4>
+                        <div class="api-setting-item">
+                            <label for="settingElevenLabsKey">API Key</label>
+                            <div class="api-input-row">
+                                <input type="password" id="settingElevenLabsKey" data-key="ELEVENLABS_API_KEY" placeholder="sk_..." class="api-key-input" />
+                                <button class="btn-toggle-vis" title="Show/Hide" onclick="toggleKeyVisibility(this)">Show</button>
+                            </div>
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingElevenLabsVoice">Voice ID</label>
+                            <input type="text" id="settingElevenLabsVoice" data-key="ELEVENLABS_VOICE_ID" placeholder="Voice ID" class="api-key-input" />
+                        </div>
+                    </div>
+
+                    <!-- Twilio -->
+                    <div class="api-settings-group">
+                        <h4>Twilio</h4>
+                        <div class="api-setting-item">
+                            <label for="settingTwilioSid">Account SID</label>
+                            <input type="text" id="settingTwilioSid" data-key="TWILIO_ACCOUNT_SID" placeholder="AC..." class="api-key-input" />
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingTwilioToken">Auth Token</label>
+                            <div class="api-input-row">
+                                <input type="password" id="settingTwilioToken" data-key="TWILIO_AUTH_TOKEN" placeholder="Auth token" class="api-key-input" />
+                                <button class="btn-toggle-vis" title="Show/Hide" onclick="toggleKeyVisibility(this)">Show</button>
+                            </div>
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingTwilioPhone">Phone Number</label>
+                            <input type="text" id="settingTwilioPhone" data-key="TWILIO_PHONE_NUMBER" placeholder="+1..." class="api-key-input" />
+                        </div>
+                    </div>
+
+                    <!-- Server -->
+                    <div class="api-settings-group">
+                        <h4>Server</h4>
+                        <div class="api-setting-item">
+                            <label for="settingServerUrl">Public URL (for Twilio webhooks)</label>
+                            <input type="text" id="settingServerUrl" data-key="SERVER_URL" placeholder="https://..." class="api-key-input" />
+                        </div>
+                    </div>
+
+                    <!-- Login Credentials -->
+                    <div class="api-settings-group">
+                        <h4>Login Credentials</h4>
+                        <div class="api-setting-item">
+                            <label for="settingLoginUser">Username</label>
+                            <input type="text" id="settingLoginUser" data-key="LOGIN_USERNAME" placeholder="admin" class="api-key-input" />
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingLoginPass">Password</label>
+                            <div class="api-input-row">
+                                <input type="password" id="settingLoginPass" data-key="LOGIN_PASSWORD" placeholder="Password" class="api-key-input" />
+                                <button class="btn-toggle-vis" title="Show/Hide" onclick="toggleKeyVisibility(this)">Show</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Save Button -->
+                    <div class="api-settings-actions">
+                        <button class="btn-save-settings" id="btnSaveSettings">Save All Changes</button>
+                        <span class="save-status hidden" id="saveStatus">Saved!</span>
                     </div>
                 </div>
             </details>
@@ -152,9 +343,9 @@
     </div>
 
     <!-- Scripts -->
-    <script src="/static/js/websocket-client.js?v=7"></script>
-    <script src="/static/js/audio-recorder.js?v=7"></script>
-    <script src="/static/js/audio-player.js?v=7"></script>
-    <script src="/static/js/main.js?v=7"></script>
+    <script src="/static/js/websocket-client.js?v=9"></script>
+    <script src="/static/js/audio-recorder.js?v=9"></script>
+    <script src="/static/js/audio-player.js?v=9"></script>
+    <script src="/static/js/main.js?v=11"></script>
 </body>
 </html>

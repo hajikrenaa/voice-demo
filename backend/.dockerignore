@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.env
+*.aac
+*.mp3
+data/
+.git

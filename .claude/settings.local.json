@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv:*)",
+      "Bash(venvScriptspip.exe install -r requirements.txt)",
+      "Bash(python -m pip install:*)",
+      "Bash(python main.py:*)",
+      "Bash(timeout:*)",
+      "Bash(exit 0)",
+      "Bash(winget install:*)",
+      "Bash(where:*)",
+      "Bash(dir:*)",
+      "Bash(dir \"C:\\\\ffmpeg\")",
+      "Bash(venvScriptspython.exe -m pip list)",
+      "Bash(.venvScriptspython.exe -m pip list)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(taskkill:*)",
+      "Bash(.venvScriptspython.exe main.py)",
+      "Bash(..venvScriptspython.exe main.py)",
+      "Bash(\"D:\\\\Project\\\\voice demo\\\\backend\\\\.venv\\\\Scripts\\\\python.exe\" main.py)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(python -m pip:*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python:*)",
+      "Bash(\"D:\\\\voice testing for twillow\\\\backend\\\\venv\\\\Scripts\\\\python.exe\":*)",
+      "Bash(\"D:\\\\voice testing for twillow\\\\backend\\\\venv\\\\Scripts\\\\pip.exe\" install:*)",
+      "Bash(ngrok http:*)",
+      "Bash(curl:*)",
+      "Bash(tasklist:*)",
+      "Bash(start:*)",
+      "Bash(wmic process:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(ffmpeg:*)"
+    ]
+  }
+}

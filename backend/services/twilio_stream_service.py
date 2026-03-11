@@ -53,7 +53,7 @@ class TwilioRealtimeHandler:
 
     OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
-    def __init__(self, use_elevenlabs: bool = False):
+    def __init__(self, use_elevenlabs: bool = False, active_script: dict = None):
         self.stream_sid: Optional[str] = None
         self.call_sid: Optional[str] = None
         self.openai_ws = None
@@ -64,9 +64,15 @@ class TwilioRealtimeHandler:
         self._elevenlabs_available = True
         self._openai_tts_client = None
         self._response_text_buffer = ""
-        # Ordered TTS queue — sentences synthesized & sent one at a time
         self._tts_queue: asyncio.Queue = asyncio.Queue()
         self._tts_worker_task = None
+        # Script passed directly from main.py at call time
+        self._script: Optional[dict] = active_script
+        self._goodbye_detected = False
+        self._hangup_task: Optional[asyncio.Task] = None
+        # Interruption tracking
+        self._current_ai_transcript = ""  # What AI is currently saying
+        self._was_interrupted = False  # Flag: response was cut short
 
     # ── Twilio message handling ─────────────────────────────
 
@@ -85,15 +91,21 @@ class TwilioRealtimeHandler:
 
             custom_params = start_data.get("customParameters", {})
             elevenlabs_param = custom_params.get("elevenlabs", "false")
-            self.use_elevenlabs = elevenlabs_param.lower() == "true"
-            if self.use_elevenlabs:
-                self._elevenlabs_tts = ElevenLabsTTSService()
-                self._elevenlabs_available = True
-                # Start TTS worker for ordered sentence processing
-                self._tts_worker_task = asyncio.create_task(self._tts_worker())
+            if elevenlabs_param.lower() == "true":
+                # Test ElevenLabs before committing to it
+                ok = await self._test_elevenlabs()
+                if ok:
+                    self.use_elevenlabs = True
+                    self._elevenlabs_tts = ElevenLabsTTSService()
+                    self._elevenlabs_available = True
+                    self._tts_worker_task = asyncio.create_task(self._tts_worker())
+                else:
+                    logger.warning("ElevenLabs unavailable — falling back to built-in voice")
+                    self.use_elevenlabs = False
 
             mode = "ElevenLabs" if self.use_elevenlabs else "built-in"
-            logger.info(f"Stream started - SID: {self.stream_sid}, Call: {self.call_sid}, Voice: {mode}")
+            has_script = "with script" if self._script else "no script"
+            logger.info(f"Stream started - SID: {self.stream_sid}, Call: {self.call_sid}, Voice: {mode}, {has_script}")
             await self._connect_openai()
 
         elif event == "media":
@@ -110,6 +122,18 @@ class TwilioRealtimeHandler:
             if self._tts_worker_task:
                 await self._tts_queue.put(None)
             await self._disconnect_openai()
+
+    # ── ElevenLabs health check ────────────────────────────
+
+    async def _test_elevenlabs(self) -> bool:
+        """Quick test if ElevenLabs API works. Returns False if no credits or bad key."""
+        try:
+            tts = ElevenLabsTTSService()
+            audio = await tts.synthesize("test")
+            return len(audio) > 0
+        except Exception as e:
+            logger.warning(f"ElevenLabs test failed: {e}")
+            return False
 
     # ── OpenAI Realtime connection ──────────────────────────
 
@@ -135,22 +159,105 @@ class TwilioRealtimeHandler:
             await self._configure_session()
             asyncio.create_task(self._receive_openai_events())
 
+            # Trigger the AI to speak first (outbound call — we initiate)
+            if self._script:
+                await self._trigger_initial_response()
+
         except Exception as e:
             logger.error(f"Failed to connect to OpenAI Realtime: {e}")
             self._connected = False
 
+    async def _trigger_initial_response(self):
+        """Send response.create so the AI speaks the welcome message immediately."""
+        try:
+            await self.openai_ws.send(json.dumps({
+                "type": "response.create",
+            }))
+            logger.info("Triggered initial AI response (outbound call)")
+        except Exception as e:
+            logger.error(f"Failed to trigger initial response: {e}")
+
+    def _build_prompt(self) -> str:
+        """Build system prompt from script config or use default."""
+        if not self._script:
+            return Config.SYSTEM_PROMPT
+
+        s = self._script
+        parts = []
+
+        # Natural sales executive personality
+        parts.append(
+            "You are a real sales executive making an outbound call. You sound exactly like a human — "
+            "warm, confident, conversational. Never admit you're AI. "
+            "If asked, laugh: \"Haha no, I'm very much real!\"\n"
+            "Talk like a real person on a call — short, natural, flowing. "
+            "Use reactions: \"Oh nice\", \"Okay great\", \"Got it\", \"Sure sure\", \"Ah okay\", \"Perfect\". "
+            "Max 1-2 sentences per turn. Never sound scripted or robotic."
+        )
+
+        if s.get("behaviour"):
+            parts.append(s['behaviour'])
+
+        if s.get("welcome"):
+            parts.append(
+                f'Start with: "{s["welcome"]}"\n'
+                f"Deliver the full welcome naturally. If interrupted, handle it, then finish your intro."
+            )
+
+        questions = s.get("questions", [])
+        if questions:
+            q_list = "\n".join(f"  {i+1}. {q}" for i, q in enumerate(questions))
+            parts.append(f"Ask these questions naturally, one by one:\n{q_list}")
+
+        if s.get("goal"):
+            parts.append(f"Goal: {s['goal']}")
+
+        parts.append(
+            "HOW TO HAVE THE CONVERSATION:\n"
+            "- Talk like a real sales person, not a form-filler. Weave questions into natural conversation.\n"
+            "- After they answer, react naturally first (\"Oh that's great\", \"Okay nice\") then move to next topic.\n"
+            "- If they say something that isn't an answer (\"hold on\", \"what?\", a question back), handle it and ask again naturally.\n"
+            "- Don't just fire questions — make it a conversation. Connect their answers to the next question.\n\n"
+            "GETTING NAMES & EMAILS RIGHT:\n"
+            "- When they say a name, repeat it back naturally: \"Prajit, right? Just to make sure I have the spelling right, "
+            "could you spell that out for me? Like P for Peter, R for...?\"\n"
+            "- If they spell raw letters and it's unclear, say naturally: \"Sorry, this connection — "
+            "could you give me a word for each letter? Like P for Peter?\"\n"
+            "- For email: \"And what's a good email? ... Got it, let me just confirm — that's prajit at gmail dot com? "
+            "Could you spell the part before @ for me? Just to be safe.\"\n"
+            "- For numbers: repeat back naturally: \"So that's 98110-01639, right?\"\n"
+            "- If they say it's wrong, don't panic: \"Oh sorry about that, could you say that one more time for me?\"\n"
+            "- After 2 wrong attempts, go slow naturally: \"Tell you what, let's take it one letter at a time so I get it perfect. First letter?\"\n"
+            "- NEVER accept something they haven't confirmed. But confirm naturally, not robotically.\n\n"
+            "WHEN INTERRUPTED:\n"
+            "- Stop, listen, respond to them.\n"
+            "- Then pick up where you were: \"Anyway, so...\" or \"Coming back to what I was asking...\"\n"
+            "- Never skip or forget where you were.\n\n"
+            "WRAPPING UP:\n"
+            "- After all info collected, quickly recap: \"So just to make sure I have everything — [details]. That all sound right?\"\n"
+            "- Fix anything wrong.\n"
+            "- \"Is there anything else you'd like to know?\" — if yes, help them. If no:\n"
+            "- \"Perfect, thanks so much for your time. Really appreciate it. Have a great day! Goodbye.\"\n"
+            "- If no response: try once more. Still nothing: \"Seems like the line dropped. No worries, take care! Goodbye.\"\n"
+            "- Always end with \"Goodbye\". Never make up facts. English only."
+        )
+        return "\n\n".join(parts)
+
     async def _configure_session(self):
-        """Configure session — g711_ulaw format, server VAD."""
+        """Configure session — g711_ulaw format, server VAD, low latency."""
         if self.use_elevenlabs:
             modalities = ["text"]
         else:
             modalities = ["text", "audio"]
 
+        prompt = self._build_prompt()
+        logger.info(f"System prompt ({len(prompt)} chars): {prompt[:100]}...")
+
         session_config = {
             "type": "session.update",
             "session": {
                 "modalities": modalities,
-                "instructions": Config.SYSTEM_PROMPT,
+                "instructions": prompt,
                 "voice": Config.REALTIME_VOICE,
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
@@ -160,14 +267,15 @@ class TwilioRealtimeHandler:
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 400,
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 500,
+                    "create_response": True,
                 },
             },
         }
         await self.openai_ws.send(json.dumps(session_config))
         mode = "ElevenLabs TTS" if self.use_elevenlabs else "built-in voice"
-        logger.info(f"Session configured — {mode}, g711_ulaw, server VAD")
+        logger.info(f"Session configured — {mode}, g711_ulaw, server VAD (200/300ms)")
 
     async def _forward_audio(self, mulaw_b64: str):
         """Forward Twilio mulaw audio directly to OpenAI."""
@@ -223,29 +331,48 @@ class TwilioRealtimeHandler:
                     logger.error(f"Error sending audio to Twilio: {e}")
 
         elif t == "response.audio_transcript.delta":
-            pass
+            # Track what the AI is currently saying (built-in voice)
+            self._current_ai_transcript += event.get("delta", "")
 
         elif t == "response.audio_transcript.done":
             transcript = event.get("transcript", "")
             if transcript:
                 logger.info(f"AI said: {transcript[:80]}...")
+                if self._contains_goodbye(transcript):
+                    self._schedule_hangup(5.0)
+            # Response finished naturally — clear tracker
+            self._current_ai_transcript = ""
 
         elif t == "response.text.delta":
             # ElevenLabs mode: accumulate text, flush on sentence boundary
             if self.use_elevenlabs:
                 self._response_text_buffer += event.get("delta", "")
                 self._flush_sentence()
+            # Also track for interruption
+            self._current_ai_transcript += event.get("delta", "")
 
         elif t == "response.text.done":
-            # Flush any remaining text in the buffer
+            full_text = event.get("text", "")
             if self.use_elevenlabs and self._response_text_buffer.strip():
                 text = self._response_text_buffer.strip()
                 self._response_text_buffer = ""
                 logger.info(f"[flush-final] {text[:60]}")
                 self._tts_queue.put_nowait(text)
+            if full_text and self._contains_goodbye(full_text):
+                self._schedule_hangup(6.0)
+            self._current_ai_transcript = ""
 
         elif t == "response.done":
-            logger.debug("Response complete")
+            status = event.get("response", {}).get("status", "")
+            if status == "cancelled" and self._was_interrupted:
+                # Response was interrupted — inject context so AI knows to resume
+                interrupted_text = self._current_ai_transcript.strip()
+                if interrupted_text:
+                    logger.info(f"Interrupted while saying: {interrupted_text[:80]}...")
+                    await self._inject_resume_context(interrupted_text)
+                self._was_interrupted = False
+            self._current_ai_transcript = ""
+            logger.debug(f"Response complete (status={status})")
 
         elif t == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
@@ -253,15 +380,11 @@ class TwilioRealtimeHandler:
                 logger.info(f"User said: {transcript[:80]}...")
 
         elif t == "input_audio_buffer.speech_started":
-            logger.debug("User speaking — clearing Twilio queue")
-            if self._twilio_ws and self.stream_sid:
-                try:
-                    await self._twilio_ws.send_json({
-                        "event": "clear",
-                        "streamSid": self.stream_sid,
-                    })
-                except Exception:
-                    pass
+            logger.debug("User speaking — AI will fade out gently")
+            self._cancel_hangup()
+            self._was_interrupted = True
+            # Gentle stop: let current word/phrase finish (~300ms) before clearing
+            asyncio.create_task(self._gentle_clear(0.3))
 
         elif t == "error":
             error = event.get("error", {})
@@ -395,6 +518,89 @@ class TwilioRealtimeHandler:
             except Exception as e:
                 logger.error(f"Error sending chunk to Twilio: {e}")
                 break
+
+    # ── Gentle audio stop ─────────────────────────────────
+
+    async def _gentle_clear(self, delay: float):
+        """Wait a moment for current word to finish, then clear Twilio audio."""
+        try:
+            await asyncio.sleep(delay)
+            if self._twilio_ws and self.stream_sid:
+                await self._twilio_ws.send_json({
+                    "event": "clear",
+                    "streamSid": self.stream_sid,
+                })
+                logger.debug("Twilio audio cleared gently")
+        except Exception:
+            pass
+
+    # ── Interruption resume ───────────────────────────────
+
+    async def _inject_resume_context(self, interrupted_text: str):
+        """Inject a system message so the AI knows what it was saying before interruption."""
+        try:
+            await self.openai_ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{
+                        "type": "input_text",
+                        "text": (
+                            f"You were interrupted while saying: \"{interrupted_text}\". "
+                            f"First, address what the caller just said. "
+                            f"Then say \"Anyway, as I was saying...\" and CONTINUE from where you stopped. "
+                            f"Do NOT repeat what you already said. Do NOT skip anything."
+                        )
+                    }]
+                }
+            }))
+            logger.info("Injected resume context after interruption")
+        except Exception as e:
+            logger.error(f"Failed to inject resume context: {e}")
+
+    # ── Auto-hangup detection ──────────────────────────────
+
+    def _contains_goodbye(self, text: str) -> bool:
+        """Check if the AI's response ends with a goodbye."""
+        lower = text.lower().strip().rstrip("!.,")
+        goodbye_words = ["goodbye", "good bye", "bye bye", "bye"]
+        for phrase in goodbye_words:
+            if lower.endswith(phrase):
+                logger.info("Goodbye detected in AI response")
+                return True
+        return False
+
+    def _schedule_hangup(self, delay: float):
+        """Schedule a hangup — cancellable if user speaks again."""
+        self._cancel_hangup()
+        self._goodbye_detected = True
+        self._hangup_task = asyncio.create_task(self._hangup_after_delay(delay))
+
+    def _cancel_hangup(self):
+        """Cancel pending hangup because user is still talking."""
+        if self._hangup_task and not self._hangup_task.done():
+            self._hangup_task.cancel()
+            self._goodbye_detected = False
+            logger.info("Hangup cancelled — user is still speaking")
+
+    async def _hangup_after_delay(self, delay: float):
+        """Wait for AI audio to finish, then hang up. Cancelled if user speaks."""
+        try:
+            logger.info(f"Auto-hangup scheduled in {delay}s (cancels if user speaks)")
+            await asyncio.sleep(delay)
+
+            if self.call_sid:
+                from twilio.rest import Client as TwilioClient
+                client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+                client.calls(self.call_sid).update(status="completed")
+                logger.info(f"Call {self.call_sid} hung up automatically after goodbye")
+            else:
+                logger.warning("No call_sid available for auto-hangup")
+        except asyncio.CancelledError:
+            logger.info("Hangup was cancelled — conversation continues")
+        except Exception as e:
+            logger.error(f"Auto-hangup failed: {e}")
 
     # ── Cleanup ─────────────────────────────────────────────
 
