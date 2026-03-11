@@ -440,6 +440,7 @@ async def twilio_voice_webhook(request: Request):
 </Response>"""
 
     logger.info(f"Twilio voice webhook called, script_active={_active_script is not None}")
+    logger.info(f"Generated TwiML: {twiml}")
     return Response(content=twiml, media_type="application/xml")
 
 
