@@ -520,14 +520,16 @@ async def twilio_media_stream(websocket: WebSocket):
       Twilio (mulaw 8kHz) → PCM16 24kHz → OpenAI Realtime API
       OpenAI Realtime API → PCM16 24kHz → mulaw 8kHz → Twilio
     """
+    logger.info(f"Incoming WebSocket connection to /ws/twilio-stream. Headers: {dict(websocket.headers)}")
     await websocket.accept()
-    logger.info("Twilio media stream WebSocket connected")
+    logger.info("Twilio media stream WebSocket connected and accepted")
 
     handler = TwilioRealtimeHandler(active_script=_active_script)
 
     try:
         async for raw_message in websocket.iter_text():
             try:
+                logger.info(f"Received raw message from Twilio: {raw_message[:100]}...")
                 message = json.loads(raw_message)
                 await handler.handle_twilio_message(websocket, message)
             except json.JSONDecodeError:
@@ -542,6 +544,12 @@ async def twilio_media_stream(websocket: WebSocket):
     finally:
         await handler._disconnect_openai()
         logger.info(f"Twilio stream closed - CallSID: {handler.call_sid}")
+
+@app.get("/ws/twilio-stream")
+async def twilio_stream_fallback_get(request: Request):
+    """Temporary endpoint to log what headers we're receiving if WebSocket upgrade fails."""
+    logger.error(f"Received HTTP GET instead of WebSocket on /ws/twilio-stream. Headers: {dict(request.headers)}")
+    return {"error": "Expected WebSocket connection"}
 
 
 @app.get("/twilio/status")
