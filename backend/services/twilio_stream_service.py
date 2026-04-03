@@ -72,7 +72,9 @@ class TwilioRealtimeHandler:
         self._hangup_task: Optional[asyncio.Task] = None
         # Interruption tracking
         self._current_ai_transcript = ""  # What AI is currently saying
-        self._was_interrupted = False  # Flag: response was cut short
+        self._ai_is_responding = False  # True while AI is generating a response
+        # Audio resampling state (mulaw 8kHz → pcm16 24kHz)
+        self._ratecv_state = None
 
     # ── Twilio message handling ─────────────────────────────
 
@@ -150,8 +152,10 @@ class TwilioRealtimeHandler:
             self.openai_ws = await websockets.connect(
                 url,
                 additional_headers=headers,
-                ping_interval=20,
+                ping_interval=30,
                 ping_timeout=10,
+                max_size=2**20,
+                compression=None,
             )
             self._connected = True
             logger.info(f"Connected to OpenAI Realtime API ({model})")
@@ -185,14 +189,27 @@ class TwilioRealtimeHandler:
         s = self._script
         parts = []
 
-        # Natural sales executive personality
+        # ── CORE RULES (compact — saves tokens every turn) ──
         parts.append(
-            "You are a real sales executive making an outbound call. You sound exactly like a human — "
-            "warm, confident, conversational. Never admit you're AI. "
-            "If asked, laugh: \"Haha no, I'm very much real!\"\n"
-            "Talk like a real person on a call — short, natural, flowing. "
-            "Use reactions: \"Oh nice\", \"Okay great\", \"Got it\", \"Sure sure\", \"Ah okay\", \"Perfect\". "
-            "Max 1-2 sentences per turn. Never sound scripted or robotic."
+            "RULES:\n"
+            "- NEVER guess or fabricate names, emails, numbers. Only use what caller confirmed.\n"
+            "- If unsure, ask again: \"Sorry, could you repeat that?\"\n"
+            "- Always repeat back names/emails for confirmation. If wrong, ask fresh.\n"
+            "- When corrected, discard old version permanently. Use only the new one.\n"
+            "- At recap, use only the LAST confirmed version of each detail.\n"
+            "- Keep responses to 1-2 short sentences. Be concise."
+        )
+
+        # ── Personality ──
+        parts.append(
+            "You are a real sales executive on an outbound call. Sound human — warm, confident, natural.\n"
+            "Max 1-2 sentences per turn. Never sound scripted.\n"
+            "ACTIVE LISTENING — while the caller is speaking, use back-channel sounds naturally:\n"
+            "  \"Mm-hmm\", \"Right\", \"Uh-huh\", \"Sure\", \"Okay\", \"Got it\", \"Yeah\"\n"
+            "After they finish, react before moving on: \"Oh nice\", \"Great\", \"Okay perfect\".\n"
+            "BACK-CHANNEL FROM CALLER — if you hear \"hmm\", \"uh-huh\", \"yeah\", \"okay\" "
+            "while you are mid-sentence, the caller is just acknowledging — they are NOT answering a question. "
+            "Continue what you were saying naturally. Do NOT treat acknowledgments as answers."
         )
 
         if s.get("behaviour"):
@@ -213,38 +230,21 @@ class TwilioRealtimeHandler:
             parts.append(f"Goal: {s['goal']}")
 
         parts.append(
-            "HOW TO HAVE THE CONVERSATION:\n"
-            "- Talk like a real sales person, not a form-filler. Weave questions into natural conversation.\n"
-            "- After they answer, react naturally first (\"Oh that's great\", \"Okay nice\") then move to next topic.\n"
-            "- If they say something that isn't an answer (\"hold on\", \"what?\", a question back), handle it and ask again naturally.\n"
-            "- Don't just fire questions — make it a conversation. Connect their answers to the next question.\n\n"
-            "GETTING NAMES & EMAILS RIGHT:\n"
-            "- When they say a name, repeat it back naturally: \"Prajit, right? Just to make sure I have the spelling right, "
-            "could you spell that out for me? Like P for Peter, R for...?\"\n"
-            "- If they spell raw letters and it's unclear, say naturally: \"Sorry, this connection — "
-            "could you give me a word for each letter? Like P for Peter?\"\n"
-            "- For email: \"And what's a good email? ... Got it, let me just confirm — that's prajit at gmail dot com? "
-            "Could you spell the part before @ for me? Just to be safe.\"\n"
-            "- For numbers: repeat back naturally: \"So that's 98110-01639, right?\"\n"
-            "- If they say it's wrong, don't panic: \"Oh sorry about that, could you say that one more time for me?\"\n"
-            "- After 2 wrong attempts, go slow naturally: \"Tell you what, let's take it one letter at a time so I get it perfect. First letter?\"\n"
-            "- NEVER accept something they haven't confirmed. But confirm naturally, not robotically.\n\n"
-            "WHEN INTERRUPTED:\n"
-            "- Stop, listen, respond to them.\n"
-            "- Then pick up where you were: \"Anyway, so...\" or \"Coming back to what I was asking...\"\n"
-            "- Never skip or forget where you were.\n\n"
-            "WRAPPING UP:\n"
-            "- After all info collected, quickly recap: \"So just to make sure I have everything — [details]. That all sound right?\"\n"
-            "- Fix anything wrong.\n"
-            "- \"Is there anything else you'd like to know?\" — if yes, help them. If no:\n"
-            "- \"Perfect, thanks so much for your time. Really appreciate it. Have a great day! Goodbye.\"\n"
-            "- If no response: try once more. Still nothing: \"Seems like the line dropped. No worries, take care! Goodbye.\"\n"
-            "- Always end with \"Goodbye\". Never make up facts. English only."
+            "CONVERSATION:\n"
+            "- Ask questions one by one. React naturally before moving on.\n"
+            "- For names: repeat back and confirm. If unclear, ask to spell with words (H for Hotel).\n"
+            "- For emails: confirm domain (gmail/yahoo/etc), repeat full email back.\n"
+            "- For numbers: repeat back digit by digit.\n"
+            "- Never move on until caller confirms. If wrong, ask again fresh.\n"
+            "- If caller says just \"hmm\"/\"yeah\"/\"okay\" after your question, that's NOT an answer — "
+            "they're thinking. Wait, or gently prompt: \"Take your time\" or repeat the question.\n"
+            "- When corrected, discard old version, use only the new one.\n"
+            "- Recap only final confirmed details. End with \"Goodbye\". English only."
         )
         return "\n\n".join(parts)
 
     async def _configure_session(self):
-        """Configure session — g711_ulaw format, server VAD, low latency."""
+        """Configure session — g711_ulaw format, server VAD, tuned for phone accuracy."""
         if self.use_elevenlabs:
             modalities = ["text"]
         else:
@@ -259,30 +259,60 @@ class TwilioRealtimeHandler:
                 "modalities": modalities,
                 "instructions": prompt,
                 "voice": Config.REALTIME_VOICE,
-                "input_audio_format": "g711_ulaw",
+                "input_audio_format": "pcm16",
                 "output_audio_format": "g711_ulaw",
+                "temperature": 0.4,
+                "max_response_output_tokens": 80,
                 "input_audio_transcription": {
                     "model": "whisper-1",
+                    "language": "en",
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 200,
-                    "silence_duration_ms": 500,
+                    "threshold": 0.45,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 700,
                     "create_response": True,
                 },
             },
         }
         await self.openai_ws.send(json.dumps(session_config))
         mode = "ElevenLabs TTS" if self.use_elevenlabs else "built-in voice"
-        logger.info(f"Session configured — {mode}, g711_ulaw, server VAD (200/300ms)")
+        logger.info(f"Session configured — {mode}, pcm16/g711_ulaw, VAD(0.45/300/700), temp=0.4, max=80tok")
+
+    # Echo gate: audio energy (RMS) below this threshold is treated as
+    # echo/noise and dropped when the AI is speaking.
+    # Phone echo ≈ 500–2000 RMS, direct caller speech ≈ 3000–15000+ RMS.
+    ECHO_GATE_RMS = 2500
 
     async def _forward_audio(self, mulaw_b64: str):
-        """Forward Twilio mulaw audio directly to OpenAI."""
+        """Convert Twilio mulaw 8kHz → pcm16 24kHz and forward to OpenAI.
+
+        When the AI is speaking, applies an echo gate: incoming audio whose
+        energy is below ECHO_GATE_RMS is dropped (it's just the AI's voice
+        leaking through the caller's microphone or background noise).
+        Only loud-enough audio (actual caller speech) passes through.
+        """
         try:
+            mulaw_bytes = base64.b64decode(mulaw_b64)
+            # mulaw → linear PCM 16-bit
+            pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
+
+            # ── Echo gate: active only while AI is speaking ──
+            if self._ai_is_responding:
+                rms = audioop.rms(pcm_8k, 2)
+                if rms < self.ECHO_GATE_RMS:
+                    return  # drop — echo or background noise
+
+            # Upsample 8kHz → 24kHz (stateful for seamless chunk joins)
+            pcm_24k, self._ratecv_state = audioop.ratecv(
+                pcm_8k, 2, 1, 8000, 24000, self._ratecv_state
+            )
+            pcm_b64 = base64.b64encode(pcm_24k).decode("utf-8")
+
             await self.openai_ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
-                "audio": mulaw_b64,
+                "audio": pcm_b64,
             }))
         except Exception as e:
             logger.error(f"Error forwarding audio: {e}")
@@ -317,6 +347,9 @@ class TwilioRealtimeHandler:
         elif t == "session.updated":
             logger.info("OpenAI session updated")
 
+        elif t == "response.created":
+            self._ai_is_responding = True
+
         elif t == "response.audio.delta":
             # Built-in voice: stream g711_ulaw straight to Twilio
             audio_b64 = event.get("delta", "")
@@ -331,7 +364,6 @@ class TwilioRealtimeHandler:
                     logger.error(f"Error sending audio to Twilio: {e}")
 
         elif t == "response.audio_transcript.delta":
-            # Track what the AI is currently saying (built-in voice)
             self._current_ai_transcript += event.get("delta", "")
 
         elif t == "response.audio_transcript.done":
@@ -340,15 +372,12 @@ class TwilioRealtimeHandler:
                 logger.info(f"AI said: {transcript[:80]}...")
                 if self._contains_goodbye(transcript):
                     self._schedule_hangup(5.0)
-            # Response finished naturally — clear tracker
             self._current_ai_transcript = ""
 
         elif t == "response.text.delta":
-            # ElevenLabs mode: accumulate text, flush on sentence boundary
             if self.use_elevenlabs:
                 self._response_text_buffer += event.get("delta", "")
                 self._flush_sentence()
-            # Also track for interruption
             self._current_ai_transcript += event.get("delta", "")
 
         elif t == "response.text.done":
@@ -364,27 +393,31 @@ class TwilioRealtimeHandler:
 
         elif t == "response.done":
             status = event.get("response", {}).get("status", "")
-            if status == "cancelled" and self._was_interrupted:
-                # Response was interrupted — inject context so AI knows to resume
-                interrupted_text = self._current_ai_transcript.strip()
-                if interrupted_text:
-                    logger.info(f"Interrupted while saying: {interrupted_text[:80]}...")
-                    await self._inject_resume_context(interrupted_text)
-                self._was_interrupted = False
+            self._ai_is_responding = False
             self._current_ai_transcript = ""
-            logger.debug(f"Response complete (status={status})")
+            if status == "cancelled":
+                logger.info("Response cancelled (user spoke during AI speech)")
+            else:
+                logger.debug(f"Response complete (status={status})")
 
         elif t == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
             if transcript:
-                logger.info(f"User said: {transcript[:80]}...")
+                logger.info(f"User said: \"{transcript}\"")
+            else:
+                logger.warning("User audio transcription was EMPTY — likely garbled or too quiet")
+
+        elif t == "conversation.item.input_audio_transcription.failed":
+            error = event.get("error", {})
+            logger.error(f"Transcription FAILED: {error.get('message', 'unknown')}")
 
         elif t == "input_audio_buffer.speech_started":
-            logger.debug("User speaking — AI will fade out gently")
             self._cancel_hangup()
-            self._was_interrupted = True
-            # Gentle stop: let current word/phrase finish (~300ms) before clearing
-            asyncio.create_task(self._gentle_clear(0.3))
+            if self._ai_is_responding:
+                # User spoke while AI is speaking — clear buffered audio
+                # after a short delay so current word finishes naturally
+                logger.info("User spoke during AI response — clearing audio")
+                asyncio.create_task(self._gentle_clear(0.15))
 
         elif t == "error":
             error = event.get("error", {})
@@ -533,31 +566,6 @@ class TwilioRealtimeHandler:
                 logger.debug("Twilio audio cleared gently")
         except Exception:
             pass
-
-    # ── Interruption resume ───────────────────────────────
-
-    async def _inject_resume_context(self, interrupted_text: str):
-        """Inject a system message so the AI knows what it was saying before interruption."""
-        try:
-            await self.openai_ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "system",
-                    "content": [{
-                        "type": "input_text",
-                        "text": (
-                            f"You were interrupted while saying: \"{interrupted_text}\". "
-                            f"First, address what the caller just said. "
-                            f"Then say \"Anyway, as I was saying...\" and CONTINUE from where you stopped. "
-                            f"Do NOT repeat what you already said. Do NOT skip anything."
-                        )
-                    }]
-                }
-            }))
-            logger.info("Injected resume context after interruption")
-        except Exception as e:
-            logger.error(f"Failed to inject resume context: {e}")
 
     # ── Auto-hangup detection ──────────────────────────────
 

@@ -31,7 +31,8 @@
       "Bash(wmic process:*)",
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(ffmpeg:*)"
+      "Bash(ffmpeg:*)",
+      "Bash(cd:*)"
     ]
   }
 }
