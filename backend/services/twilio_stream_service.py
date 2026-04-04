@@ -80,7 +80,7 @@ class TwilioRealtimeHandler:
         # because Twilio is still playing audio and the caller's phone echoes it back.
         # Without this, echoed audio triggers ghost responses.
         self._echo_gate_until = 0.0  # timestamp until which echo gate stays active
-        self._ECHO_COOLDOWN = 1.5  # seconds after last AI audio chunk (echo round-trip ~0.3-0.6s)
+        self._ECHO_COOLDOWN = 1.0  # seconds after last AI audio chunk (echo round-trip ~0.3-0.6s)
 
     # ── Twilio message handling ─────────────────────────────
 
@@ -246,28 +246,28 @@ class TwilioRealtimeHandler:
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "temperature": 0.8,
-                "max_response_output_tokens": 150,
+                "max_response_output_tokens": 100,
                 "input_audio_transcription": {
                     "model": "whisper-1",
                     "language": "en",
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 400,
+                    "threshold": 0.45,
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 300,
                     "create_response": True,
                 },
             },
         }
         await self.openai_ws.send(json.dumps(session_config))
         mode = "ElevenLabs TTS" if self.use_elevenlabs else "built-in voice"
-        logger.info(f"Session configured — {mode}, g711_ulaw, VAD(0.5/300/400), temp=0.8, max=150tok")
+        logger.info(f"Session configured — {mode}, g711_ulaw, VAD(0.45/200/300), temp=0.8, max=100tok")
 
     # Echo gate: audio energy (RMS) below this threshold is treated as
     # echo/noise and dropped when the AI is speaking or during echo cooldown.
-    # Phone echo ≈ 500–2000 RMS, direct caller speech ≈ 3000–15000+ RMS.
-    ECHO_GATE_RMS = 2000
+    # Phone echo ≈ 500–1500 RMS, direct caller speech ≈ 2000–15000+ RMS.
+    ECHO_GATE_RMS = 1500
 
     def _is_echo_gate_active(self) -> bool:
         """Check if echo gate should be filtering audio right now."""
@@ -408,10 +408,11 @@ class TwilioRealtimeHandler:
         elif t == "input_audio_buffer.speech_started":
             self._cancel_hangup()
             if self._ai_is_responding or self._tts_playing or self._is_echo_gate_active():
-                logger.info("User spoke during AI response — clearing audio and TTS queue")
+                logger.info("User interrupted — clearing audio immediately")
                 self._drain_tts_queue()
                 self._response_text_buffer = ""
-                asyncio.create_task(self._gentle_clear(0.15))
+                # Clear Twilio audio buffer IMMEDIATELY — no delay
+                asyncio.create_task(self._gentle_clear(0.0))
 
         elif t == "error":
             error = event.get("error", {})
