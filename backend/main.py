@@ -623,8 +623,10 @@ async def websocket_realtime_endpoint(websocket: WebSocket):
             try:
                 async for event in realtime_service.receive_events():
                     await event_handler.handle_event(event)
+            except asyncio.CancelledError:
+                logger.info("OpenAI event receiver cancelled")
             except Exception as e:
-                logger.error(f"Error in OpenAI event receiver: {e}")
+                logger.exception(f"Error in OpenAI event receiver: {e}")
         
         # Task to receive audio from client and forward to OpenAI
         async def receive_from_client():
@@ -650,16 +652,27 @@ async def websocket_realtime_endpoint(websocket: WebSocket):
                         
             except WebSocketDisconnect:
                 logger.info("Client disconnected from realtime endpoint")
+            except RuntimeError as e:
+                if "WebSocket is not connected" in str(e) or "Cannot call" in str(e):
+                    logger.info("Client disconnected abruptly (RuntimeError)")
+                else:
+                    logger.error(f"RuntimeError in client receiver: {e}")
+            except asyncio.CancelledError:
+                logger.info("Client receiver cancelled")
             except Exception as e:
-                logger.error(f"Error in client receiver: {e}")
+                logger.exception(f"Error in client receiver: {e}")
         
         # Run both tasks concurrently
-        await asyncio.gather(
-            receive_from_openai(),
-            receive_from_client(),
-            return_exceptions=True
+        task_openai = asyncio.create_task(receive_from_openai())
+        task_client = asyncio.create_task(receive_from_client())
+        
+        done, pending = await asyncio.wait(
+            [task_openai, task_client],
+            return_when=asyncio.FIRST_COMPLETED
         )
         
+        for task in pending:
+            task.cancel()
     except Exception as e:
         logger.error(f"Realtime WebSocket error: {e}")
         await websocket.send_json({
