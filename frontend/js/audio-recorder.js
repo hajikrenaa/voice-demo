@@ -633,8 +633,23 @@ class AudioRecorder {
     cleanup() {
         this.stopRecording();
 
+        // Stop MediaRecorder stream tracks
         if (this.mediaRecorder && this.mediaRecorder.stream) {
             this.mediaRecorder.stream.getTracks().forEach(track => track.stop());
+        }
+
+        // Stop PCM stream tracks (microphone release)
+        if (this._pcmStream) {
+            this._pcmStream.getTracks().forEach(track => track.stop());
+            this._pcmStream = null;
+        }
+
+        // Disconnect ScriptProcessor
+        if (this.scriptProcessor) {
+            try {
+                this.scriptProcessor.disconnect();
+            } catch (e) { /* already disconnected */ }
+            this.scriptProcessor = null;
         }
 
         if (this.audioContext) {

@@ -2,7 +2,6 @@ from openai import AsyncOpenAI, OpenAIError
 from config import Config
 from typing import AsyncIterator, List, Dict
 import logging
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +96,8 @@ class LLMService:
                     full_response += token
                     sentence_buffer += token
 
-                    # Check if we have a complete sentence
-                    if token in sentence_endings:
+                    # Check if the token ends with sentence-ending punctuation
+                    if any(token.rstrip().endswith(p) for p in sentence_endings):
                         sentence = sentence_buffer.strip()
                         if sentence and len(sentence) > 3:  # Avoid single-word yields
                             logger.debug(f"Yielding sentence: {sentence}")
@@ -106,7 +105,7 @@ class LLMService:
                             sentence_buffer = ""
 
                     # Yield on commas for faster starts (but require min length)
-                    elif token in quick_breaks and len(sentence_buffer.strip()) > 20:
+                    elif any(token.rstrip().endswith(p) for p in quick_breaks) and len(sentence_buffer.strip()) > 20:
                         sentence = sentence_buffer.strip()
                         if sentence:
                             logger.debug(f"Yielding on pause: {sentence}")

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Cookie, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -9,9 +9,10 @@ import sys
 import asyncio
 import json
 import uuid
-import hashlib
+import time
 import secrets
 from pathlib import Path
+from html import escape as html_escape
 
 # Import services
 from services.whisper_service import WhisperService
@@ -24,13 +25,13 @@ from utils.audio_processing import (
     decode_base64_audio,
     encode_audio_to_base64,
     convert_to_wav,
-    preprocess_audio_for_whisper,
-    validate_audio
 )
 from config import Config
 
-# Active sessions — maps session tokens to True
-_active_sessions: set[str] = set()
+# Active sessions — maps token -> expiry timestamp (24h TTL)
+_SESSION_TTL = 86400  # 24 hours
+_MAX_SESSIONS = 100
+_active_sessions: dict[str, float] = {}
 
 # Active script — set via /api/script/activate, used by all outbound calls
 _active_script: dict | None = None
@@ -56,7 +57,7 @@ def _save_scripts(scripts: list):
 
 # Configure logging
 logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL),
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
@@ -74,8 +75,8 @@ app = FastAPI(
 # CORS middleware for browser access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -109,7 +110,7 @@ async def root():
             )
     except Exception as e:
         logger.error(f"Error serving root: {e}")
-        return HTMLResponse(content=f"<h1>Error: {str(e)}</h1>")
+        return HTMLResponse(content=f"<h1>Error: {html_escape(str(e))}</h1>")
 
 
 @app.get("/api/health")
@@ -146,16 +147,27 @@ async def get_config():
 # ==========================================
 
 def _verify_token(token: str | None) -> bool:
-    """Check if a session token is valid."""
-    return token is not None and token in _active_sessions
+    """Check if a session token is valid and not expired."""
+    if not token or token not in _active_sessions:
+        return False
+    if time.time() > _active_sessions[token]:
+        _active_sessions.pop(token, None)
+        return False
+    return True
 
 
-async def require_auth(request: Request):
-    """Dependency that checks for a valid session token in the Authorization header."""
+def _require_auth(request: Request) -> bool:
+    """Check Authorization header. Returns True if valid, False otherwise."""
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if not _verify_token(token):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    return None
+    return _verify_token(token)
+
+
+def _cleanup_sessions():
+    """Evict expired sessions."""
+    now = time.time()
+    expired = [t for t, exp in _active_sessions.items() if now > exp]
+    for t in expired:
+        _active_sessions.pop(t, None)
 
 
 @app.post("/api/login")
@@ -165,9 +177,16 @@ async def login(request: Request):
     username = body.get("username", "")
     password = body.get("password", "")
 
-    if username == Config.LOGIN_USERNAME and password == Config.LOGIN_PASSWORD:
+    user_ok = secrets.compare_digest(username, Config.LOGIN_USERNAME)
+    pass_ok = secrets.compare_digest(password, Config.LOGIN_PASSWORD)
+    if user_ok and pass_ok:
+        _cleanup_sessions()
+        # Cap max sessions to prevent memory growth
+        if len(_active_sessions) >= _MAX_SESSIONS:
+            oldest = min(_active_sessions, key=_active_sessions.get)
+            _active_sessions.pop(oldest, None)
         token = secrets.token_hex(32)
-        _active_sessions.add(token)
+        _active_sessions[token] = time.time() + _SESSION_TTL
         logger.info(f"User '{username}' logged in")
         return JSONResponse({"success": True, "token": token})
 
@@ -188,7 +207,7 @@ async def auth_check(request: Request):
 async def logout(request: Request):
     """Invalidate the session token."""
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    _active_sessions.discard(token)
+    _active_sessions.pop(token, None)
     return JSONResponse({"success": True})
 
 
@@ -333,6 +352,8 @@ async def update_settings(request: Request):
 @app.post("/api/script/activate")
 async def activate_script(request: Request):
     """Activate a script so all outbound calls use it."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     global _active_script
     body = await request.json()
     _active_script = body
@@ -341,8 +362,10 @@ async def activate_script(request: Request):
 
 
 @app.post("/api/script/deactivate")
-async def deactivate_script():
+async def deactivate_script(request: Request):
     """Deactivate the current script — calls use default prompt."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     global _active_script
     _active_script = None
     logger.info("Script deactivated")
@@ -350,8 +373,10 @@ async def deactivate_script():
 
 
 @app.get("/api/script/status")
-async def script_status():
+async def script_status(request: Request):
     """Check if a script is currently active."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return JSONResponse({
         "active": _active_script is not None,
         "script": _active_script
@@ -363,14 +388,18 @@ async def script_status():
 # ==========================================
 
 @app.get("/api/scripts")
-async def list_scripts():
+async def list_scripts(request: Request):
     """List all saved scripts."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return JSONResponse(_load_scripts())
 
 
 @app.post("/api/scripts")
 async def save_script(request: Request):
     """Save a new script (or update existing by id)."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     scripts = _load_scripts()
 
@@ -400,8 +429,10 @@ async def save_script(request: Request):
 
 
 @app.delete("/api/scripts/{script_id}")
-async def delete_script(script_id: str):
+async def delete_script(script_id: str, request: Request):
     """Delete a saved script."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     global _active_script
     scripts = _load_scripts()
     scripts = [s for s in scripts if s["id"] != script_id]
@@ -428,7 +459,8 @@ async def twilio_voice_webhook(request: Request):
     server_url = Config.SERVER_URL
     ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://")
 
-    use_elevenlabs = request.query_params.get("elevenlabs", "false")
+    # Sanitize to prevent TwiML injection — only allow "true" or "false"
+    use_elevenlabs = "true" if request.query_params.get("elevenlabs", "false").lower() == "true" else "false"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -452,6 +484,8 @@ async def make_outbound_call(request: Request):
 
     Request body: { "to": "+1234567890" }
     """
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
         from twilio.rest import Client as TwilioClient
 
@@ -492,6 +526,8 @@ async def make_outbound_call(request: Request):
 @app.post("/twilio/hangup")
 async def hangup_call(request: Request):
     """Hang up an active Twilio call."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
         from twilio.rest import Client as TwilioClient
 
@@ -531,8 +567,10 @@ async def twilio_media_stream(websocket: WebSocket):
     try:
         async for raw_message in websocket.iter_text():
             try:
-                logger.info(f"Received raw message from Twilio: {raw_message[:100]}...")
                 message = json.loads(raw_message)
+                event = message.get("event")
+                if event != "media":
+                    logger.info(f"Twilio stream event: {event}")
                 await handler.handle_twilio_message(websocket, message)
             except json.JSONDecodeError:
                 logger.error("Failed to parse Twilio stream message")
@@ -544,7 +582,7 @@ async def twilio_media_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Twilio stream WebSocket error: {e}")
     finally:
-        await handler._disconnect_openai()
+        await handler._full_cleanup()
         logger.info(f"Twilio stream closed - CallSID: {handler.call_sid}")
 
 @app.get("/ws/twilio-stream")
@@ -675,11 +713,14 @@ async def websocket_realtime_endpoint(websocket: WebSocket):
             task.cancel()
     except Exception as e:
         logger.error(f"Realtime WebSocket error: {e}")
-        await websocket.send_json({
-            "type": "error",
-            "code": "REALTIME_ERROR",
-            "message": str(e)
-        })
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "code": "REALTIME_ERROR",
+                "message": str(e)
+            })
+        except Exception:
+            pass
     
     finally:
         await realtime_service.disconnect()

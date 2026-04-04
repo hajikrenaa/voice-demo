@@ -131,7 +131,15 @@ function setupLoginHandler() {
 /**
  * Initialize the main app (called after successful auth)
  */
+let _appInitialized = false;
 function initApp() {
+    // Prevent duplicate initialization (e.g. re-login without page reload)
+    if (_appInitialized) {
+        // Clean up old instances
+        if (wsClient) { wsClient.close(); }
+        if (audioPlayer) { audioPlayer.cleanup(); }
+    }
+
     // Get UI elements
     initializeUIElements();
 
@@ -146,9 +154,12 @@ function initApp() {
     // Set up WebSocket message handlers
     setupWebSocketHandlers();
 
-    // Set up UI event handlers
-    setupUIHandlers();
+    // Set up UI event handlers (only once)
+    if (!_appInitialized) {
+        setupUIHandlers();
+    }
 
+    _appInitialized = true;
     console.log('Application initialized');
 }
 
@@ -751,9 +762,16 @@ async function stopConversation() {
             audioRecorder = null;
         }
 
-        // Send end conversation signal
+        // Send end conversation signal, then close the WebSocket
         if (wsClient && wsClient.isConnected) {
-            wsClient.endConversation();
+            try {
+                wsClient.endConversation();
+            } catch (e) {
+                // Ignore send errors on already-closing socket
+            }
+            // Close the WebSocket to prevent ghost connections and reconnect loops
+            wsClient.reconnectAttempts = wsClient.maxReconnectAttempts; // prevent auto-reconnect
+            wsClient.close();
         }
 
         // Update UI
@@ -1088,7 +1106,7 @@ function displaySummary(summary) {
         summaryHTML += `
             <div class="summary-section">
                 <h3>Overview</h3>
-                <p>${summary.overview}</p>
+                <p>${escapeHtml(summary.overview)}</p>
             </div>
         `;
     }
@@ -1099,7 +1117,7 @@ function displaySummary(summary) {
             <div class="summary-section">
                 <h3>Key Points</h3>
                 <ul>
-                    ${summary.key_points.map(point => `<li>${point}</li>`).join('')}
+                    ${summary.key_points.map(point => `<li>${escapeHtml(point)}</li>`).join('')}
                 </ul>
             </div>
         `;
@@ -1110,7 +1128,7 @@ function displaySummary(summary) {
         summaryHTML += `
             <div class="summary-section">
                 <h3>Topics Discussed</h3>
-                <p>${summary.topics.join(', ')}</p>
+                <p>${summary.topics.map(t => escapeHtml(t)).join(', ')}</p>
             </div>
         `;
     }
@@ -1121,7 +1139,7 @@ function displaySummary(summary) {
             <div class="summary-section">
                 <h3>Action Items</h3>
                 <ul>
-                    ${summary.action_items.map(item => `<li>${item}</li>`).join('')}
+                    ${summary.action_items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
                 </ul>
             </div>
         `;
@@ -1134,7 +1152,7 @@ function displaySummary(summary) {
                 <h3>Conversation Details</h3>
                 <p>Duration: ${Math.floor(summary.metadata.duration_seconds / 60)}m ${Math.floor(summary.metadata.duration_seconds % 60)}s</p>
                 <p>Exchanges: ${summary.metadata.turn_count}</p>
-                <p>Sentiment: ${summary.sentiment || 'Neutral'}</p>
+                <p>Sentiment: ${escapeHtml(summary.sentiment || 'Neutral')}</p>
             </div>
         `;
     }

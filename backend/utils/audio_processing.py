@@ -1,7 +1,6 @@
 import io
 import base64
 from pydub import AudioSegment
-import numpy as np
 from config import Config
 
 
@@ -90,6 +89,10 @@ def normalize_audio(audio_bytes: bytes) -> bytes:
     """
     try:
         audio = AudioSegment.from_wav(io.BytesIO(audio_bytes))
+
+        # Guard against silent audio (dBFS is -inf for silence)
+        if audio.dBFS == float('-inf'):
+            return audio_bytes
 
         # Normalize to -20 dBFS (good level for speech)
         change_in_dBFS = -20.0 - audio.dBFS

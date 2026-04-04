@@ -58,8 +58,8 @@ class Config:
     TTS_SPEED = 1.0  # 0.25 to 4.0
 
     # OpenAI Realtime API Configuration (for ultra-low latency)
-    REALTIME_MODEL = "gpt-4o-mini-realtime-preview"
-    REALTIME_VOICE = "coral"  # Warm, clear, works well with Indian English phrasing
+    REALTIME_MODEL = "gpt-4o-realtime-preview"
+    REALTIME_VOICE = "ash"  # Calm, measured pace — better for phone clarity
     REALTIME_AUDIO_FORMAT = "pcm16"  # 24kHz, mono, 16-bit PCM
 
     # Twilio Audio Settings
@@ -67,7 +67,15 @@ class Config:
     TWILIO_AUDIO_FORMAT = "mulaw"  # Twilio media stream format
 
     # System Prompt (keep minimal to save tokens)
-    SYSTEM_PROMPT = """You are a friendly AI voice assistant. English only. Keep replies to 1-2 short sentences. Be natural and concise."""
+    SYSTEM_PROMPT = """You are a friendly AI voice assistant on a phone call. English only.
+Rules:
+- Speak slowly and clearly. Pause between sentences. Never rush.
+- Keep replies to 1-2 short sentences maximum.
+- Listen carefully. Callers may have Indian or South Asian accents — pay close attention to names, spellings, and pronunciation.
+- NAMES: When someone tells you their name, repeat it back clearly and ask to confirm. If they correct you, IMMEDIATELY discard the old name and ONLY use the corrected version from that point on. Never mention or reference the old incorrect name again.
+- If you didn't catch something, ask: "Sorry, could you say that again?" or "Could you spell that for me?"
+- Wait for the caller to finish speaking completely before you respond.
+- Greet the caller warmly when you first connect."""
 
     @classmethod
     def validate(cls):

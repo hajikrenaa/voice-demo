@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import logging
+import time
 from typing import Optional
 
 import websockets
@@ -64,17 +65,22 @@ class TwilioRealtimeHandler:
         self._elevenlabs_available = True
         self._openai_tts_client = None
         self._response_text_buffer = ""
-        self._tts_queue: asyncio.Queue = asyncio.Queue()
+        self._tts_queue: asyncio.Queue = asyncio.Queue(maxsize=20)
         self._tts_worker_task = None
+        self._receive_task: Optional[asyncio.Task] = None
         # Script passed directly from main.py at call time
         self._script: Optional[dict] = active_script
         self._goodbye_detected = False
         self._hangup_task: Optional[asyncio.Task] = None
         # Interruption tracking
-        self._current_ai_transcript = ""  # What AI is currently saying
-        self._ai_is_responding = False  # True while AI is generating a response
-        # Audio resampling state (mulaw 8kHz → pcm16 24kHz)
-        self._ratecv_state = None
+        self._current_ai_transcript = ""
+        self._ai_is_responding = False  # True while OpenAI is generating audio
+        self._tts_playing = False  # True while TTS audio is being sent to Twilio
+        # Echo cooldown: keeps the echo gate active AFTER AI finishes generating,
+        # because Twilio is still playing audio and the caller's phone echoes it back.
+        # Without this, echoed audio triggers ghost responses.
+        self._echo_gate_until = 0.0  # timestamp until which echo gate stays active
+        self._ECHO_COOLDOWN = 2.0  # seconds after last AI audio chunk (echo round-trip ~0.5-1s)
 
     # ── Twilio message handling ─────────────────────────────
 
@@ -94,16 +100,10 @@ class TwilioRealtimeHandler:
             custom_params = start_data.get("customParameters", {})
             elevenlabs_param = custom_params.get("elevenlabs", "false")
             if elevenlabs_param.lower() == "true":
-                # Test ElevenLabs before committing to it
-                ok = await self._test_elevenlabs()
-                if ok:
-                    self.use_elevenlabs = True
-                    self._elevenlabs_tts = ElevenLabsTTSService()
-                    self._elevenlabs_available = True
-                    self._tts_worker_task = asyncio.create_task(self._tts_worker())
-                else:
-                    logger.warning("ElevenLabs unavailable — falling back to built-in voice")
-                    self.use_elevenlabs = False
+                self.use_elevenlabs = True
+                self._elevenlabs_tts = ElevenLabsTTSService()
+                self._elevenlabs_available = True
+                self._tts_worker_task = asyncio.create_task(self._tts_worker())
 
             mode = "ElevenLabs" if self.use_elevenlabs else "built-in"
             has_script = "with script" if self._script else "no script"
@@ -120,27 +120,12 @@ class TwilioRealtimeHandler:
 
         elif event == "stop":
             logger.info(f"Twilio stream stopped - Call: {self.call_sid}")
-            # Stop TTS worker
-            if self._tts_worker_task:
-                await self._tts_queue.put(None)
-            await self._disconnect_openai()
-
-    # ── ElevenLabs health check ────────────────────────────
-
-    async def _test_elevenlabs(self) -> bool:
-        """Quick test if ElevenLabs API works. Returns False if no credits or bad key."""
-        try:
-            tts = ElevenLabsTTSService()
-            audio = await tts.synthesize("test")
-            return len(audio) > 0
-        except Exception as e:
-            logger.warning(f"ElevenLabs test failed: {e}")
-            return False
+            await self._full_cleanup()
 
     # ── OpenAI Realtime connection ──────────────────────────
 
     async def _connect_openai(self):
-        """Connect to OpenAI Realtime API."""
+        """Connect to OpenAI Realtime API with a connection timeout."""
         try:
             model = Config.REALTIME_MODEL
             url = f"{self.OPENAI_REALTIME_URL}?model={model}"
@@ -149,24 +134,29 @@ class TwilioRealtimeHandler:
                 "OpenAI-Beta": "realtime=v1",
             }
 
-            self.openai_ws = await websockets.connect(
-                url,
-                additional_headers=headers,
-                ping_interval=30,
-                ping_timeout=10,
-                max_size=2**20,
-                compression=None,
+            self.openai_ws = await asyncio.wait_for(
+                websockets.connect(
+                    url,
+                    additional_headers=headers,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    max_size=2**20,
+                    compression=None,
+                ),
+                timeout=10.0,
             )
             self._connected = True
             logger.info(f"Connected to OpenAI Realtime API ({model})")
 
             await self._configure_session()
-            asyncio.create_task(self._receive_openai_events())
+            self._receive_task = asyncio.create_task(self._receive_openai_events())
 
-            # Trigger the AI to speak first (outbound call — we initiate)
-            if self._script:
-                await self._trigger_initial_response()
+            # Trigger the AI to speak first — both inbound and outbound calls.
+            await self._trigger_initial_response()
 
+        except asyncio.TimeoutError:
+            logger.error("OpenAI Realtime connection timed out (10s)")
+            self._connected = False
         except Exception as e:
             logger.error(f"Failed to connect to OpenAI Realtime: {e}")
             self._connected = False
@@ -174,10 +164,10 @@ class TwilioRealtimeHandler:
     async def _trigger_initial_response(self):
         """Send response.create so the AI speaks the welcome message immediately."""
         try:
-            await self.openai_ws.send(json.dumps({
-                "type": "response.create",
-            }))
-            logger.info("Triggered initial AI response (outbound call)")
+            ws = self.openai_ws
+            if ws:
+                await ws.send(json.dumps({"type": "response.create"}))
+                logger.info("Triggered initial AI response")
         except Exception as e:
             logger.error(f"Failed to trigger initial response: {e}")
 
@@ -189,18 +179,23 @@ class TwilioRealtimeHandler:
         s = self._script
         parts = []
 
-        # ── CORE RULES (compact — saves tokens every turn) ──
         parts.append(
             "RULES:\n"
-            "- NEVER guess or fabricate names, emails, numbers. Only use what caller confirmed.\n"
-            "- If unsure, ask again: \"Sorry, could you repeat that?\"\n"
-            "- Always repeat back names/emails for confirmation. If wrong, ask fresh.\n"
-            "- When corrected, discard old version permanently. Use only the new one.\n"
-            "- At recap, use only the LAST confirmed version of each detail.\n"
-            "- Keep responses to 1-2 short sentences. Be concise."
+            "- Speak SLOWLY and CLEARLY. Pause between sentences. Never rush.\n"
+            "- Wait for the caller to finish speaking completely before you respond.\n"
+            "- Callers may have Indian or South Asian accents. Listen very carefully to names and details.\n"
+            "- If you didn't understand something, ask: \"Sorry, could you say that again?\" or \"Could you spell that for me?\"\n"
+            "- NEVER guess or fabricate names, emails, numbers. Only use what the caller explicitly confirmed.\n"
+            "- NAME CORRECTION RULE: When the caller corrects their name, you MUST:\n"
+            "  1. Completely FORGET the old incorrect name — never say it again.\n"
+            "  2. Immediately use ONLY the new corrected name.\n"
+            "  3. Repeat the corrected name back to confirm.\n"
+            "  4. In all future references and the final recap, use ONLY the corrected name.\n"
+            "- Always repeat back names/emails for confirmation before moving on.\n"
+            "- At recap, use ONLY the LAST confirmed version of each detail.\n"
+            "- Keep responses to 1-2 short sentences. Be concise but never rushed."
         )
 
-        # ── Personality ──
         parts.append(
             "You are a real sales executive on an outbound call. Sound human — warm, confident, natural.\n"
             "Max 1-2 sentences per turn. Never sound scripted.\n"
@@ -232,13 +227,13 @@ class TwilioRealtimeHandler:
         parts.append(
             "CONVERSATION:\n"
             "- Ask questions one by one. React naturally before moving on.\n"
-            "- For names: repeat back and confirm. If unclear, ask to spell with words (H for Hotel).\n"
-            "- For emails: confirm domain (gmail/yahoo/etc), repeat full email back.\n"
+            "- For names: repeat back SLOWLY and confirm. If unclear, ask to spell letter by letter using phonetic words (A for Alpha, B for Bravo, S for Sierra).\n"
+            "- For emails: spell back the full email letter by letter. Confirm the domain.\n"
             "- For numbers: repeat back digit by digit.\n"
-            "- Never move on until caller confirms. If wrong, ask again fresh.\n"
+            "- Never move on until caller explicitly confirms. If wrong, ask again from scratch — FORGET the wrong version completely.\n"
+            "- CRITICAL: When caller corrects ANY detail (name, email, number), the old version is DEAD. Only the new version exists. Never reference or repeat the old version.\n"
             "- If caller says just \"hmm\"/\"yeah\"/\"okay\" after your question, that's NOT an answer — "
             "they're thinking. Wait, or gently prompt: \"Take your time\" or repeat the question.\n"
-            "- When corrected, discard old version, use only the new one.\n"
             "- Recap only final confirmed details. End with \"Goodbye\". English only."
         )
         return "\n\n".join(parts)
@@ -259,10 +254,10 @@ class TwilioRealtimeHandler:
                 "modalities": modalities,
                 "instructions": prompt,
                 "voice": Config.REALTIME_VOICE,
-                "input_audio_format": "pcm16",
+                "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
-                "temperature": 0.4,
-                "max_response_output_tokens": 80,
+                "temperature": 0.6,
+                "max_response_output_tokens": 200,
                 "input_audio_transcription": {
                     "model": "whisper-1",
                     "language": "en",
@@ -270,49 +265,51 @@ class TwilioRealtimeHandler:
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.45,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 700,
+                    "prefix_padding_ms": 350,
+                    "silence_duration_ms": 500,
                     "create_response": True,
                 },
             },
         }
         await self.openai_ws.send(json.dumps(session_config))
         mode = "ElevenLabs TTS" if self.use_elevenlabs else "built-in voice"
-        logger.info(f"Session configured — {mode}, pcm16/g711_ulaw, VAD(0.45/300/700), temp=0.4, max=80tok")
+        logger.info(f"Session configured — {mode}, g711_ulaw, VAD(0.45/350/500), temp=0.6, max=200tok")
 
     # Echo gate: audio energy (RMS) below this threshold is treated as
-    # echo/noise and dropped when the AI is speaking.
+    # echo/noise and dropped when the AI is speaking or during echo cooldown.
     # Phone echo ≈ 500–2000 RMS, direct caller speech ≈ 3000–15000+ RMS.
-    ECHO_GATE_RMS = 2500
+    ECHO_GATE_RMS = 2000
+
+    def _is_echo_gate_active(self) -> bool:
+        """Check if echo gate should be filtering audio right now."""
+        if self._ai_is_responding or self._tts_playing:
+            return True
+        # Cooldown: Twilio buffers audio, caller phone echoes it back with delay.
+        # Keep gate active for a few seconds after AI stops generating.
+        if time.monotonic() < self._echo_gate_until:
+            return True
+        return False
 
     async def _forward_audio(self, mulaw_b64: str):
-        """Convert Twilio mulaw 8kHz → pcm16 24kHz and forward to OpenAI.
+        """Forward Twilio mulaw 8kHz directly to OpenAI (g711_ulaw — zero conversion).
 
-        When the AI is speaking, applies an echo gate: incoming audio whose
-        energy is below ECHO_GATE_RMS is dropped (it's just the AI's voice
-        leaking through the caller's microphone or background noise).
-        Only loud-enough audio (actual caller speech) passes through.
+        Echo gate is active while AI audio is playing AND during cooldown after.
+        This prevents the caller's phone echo from triggering ghost responses.
         """
         try:
-            mulaw_bytes = base64.b64decode(mulaw_b64)
-            # mulaw → linear PCM 16-bit
-            pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
-
-            # ── Echo gate: active only while AI is speaking ──
-            if self._ai_is_responding:
+            if self._is_echo_gate_active():
+                mulaw_bytes = base64.b64decode(mulaw_b64)
+                pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
                 rms = audioop.rms(pcm_8k, 2)
                 if rms < self.ECHO_GATE_RMS:
-                    return  # drop — echo or background noise
+                    return
 
-            # Upsample 8kHz → 24kHz (stateful for seamless chunk joins)
-            pcm_24k, self._ratecv_state = audioop.ratecv(
-                pcm_8k, 2, 1, 8000, 24000, self._ratecv_state
-            )
-            pcm_b64 = base64.b64encode(pcm_24k).decode("utf-8")
-
-            await self.openai_ws.send(json.dumps({
+            ws = self.openai_ws
+            if not ws:
+                return
+            await ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
-                "audio": pcm_b64,
+                "audio": mulaw_b64,
             }))
         except Exception as e:
             logger.error(f"Error forwarding audio: {e}")
@@ -332,6 +329,8 @@ class TwilioRealtimeHandler:
                     pass
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"OpenAI connection closed: {e}")
+        except asyncio.CancelledError:
+            logger.info("OpenAI receive task cancelled")
         except Exception as e:
             logger.error(f"Error receiving OpenAI events: {e}")
         finally:
@@ -351,7 +350,6 @@ class TwilioRealtimeHandler:
             self._ai_is_responding = True
 
         elif t == "response.audio.delta":
-            # Built-in voice: stream g711_ulaw straight to Twilio
             audio_b64 = event.get("delta", "")
             if audio_b64 and self._twilio_ws and self.stream_sid:
                 try:
@@ -360,6 +358,9 @@ class TwilioRealtimeHandler:
                         "streamSid": self.stream_sid,
                         "media": {"payload": audio_b64},
                     })
+                    # Refresh echo cooldown — Twilio buffers and plays this audio,
+                    # and the caller's phone will echo it back ~1-3s later.
+                    self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
                 except Exception as e:
                     logger.error(f"Error sending audio to Twilio: {e}")
 
@@ -371,13 +372,13 @@ class TwilioRealtimeHandler:
             if transcript:
                 logger.info(f"AI said: {transcript[:80]}...")
                 if self._contains_goodbye(transcript):
-                    self._schedule_hangup(5.0)
+                    self._schedule_hangup(12.0)
             self._current_ai_transcript = ""
 
         elif t == "response.text.delta":
             if self.use_elevenlabs:
                 self._response_text_buffer += event.get("delta", "")
-                self._flush_sentence()
+                self._flush_sentences()
             self._current_ai_transcript += event.get("delta", "")
 
         elif t == "response.text.done":
@@ -386,18 +387,22 @@ class TwilioRealtimeHandler:
                 text = self._response_text_buffer.strip()
                 self._response_text_buffer = ""
                 logger.info(f"[flush-final] {text[:60]}")
-                self._tts_queue.put_nowait(text)
+                await self._enqueue_tts(text)
             if full_text and self._contains_goodbye(full_text):
-                self._schedule_hangup(6.0)
+                self._schedule_hangup(12.0)
             self._current_ai_transcript = ""
 
         elif t == "response.done":
             status = event.get("response", {}).get("status", "")
             self._ai_is_responding = False
-            self._current_ai_transcript = ""
             if status == "cancelled":
-                logger.info("Response cancelled (user spoke during AI speech)")
+                # User interrupted — clear text buffer and drain TTS queue
+                self._response_text_buffer = ""
+                self._current_ai_transcript = ""
+                self._drain_tts_queue()
+                logger.info("Response cancelled (user interrupted)")
             else:
+                self._current_ai_transcript = ""
                 logger.debug(f"Response complete (status={status})")
 
         elif t == "conversation.item.input_audio_transcription.completed":
@@ -413,27 +418,53 @@ class TwilioRealtimeHandler:
 
         elif t == "input_audio_buffer.speech_started":
             self._cancel_hangup()
-            if self._ai_is_responding:
-                # User spoke while AI is speaking — clear buffered audio
-                # after a short delay so current word finishes naturally
-                logger.info("User spoke during AI response — clearing audio")
+            if self._ai_is_responding or self._tts_playing or self._is_echo_gate_active():
+                logger.info("User spoke during AI response — clearing audio and TTS queue")
+                self._drain_tts_queue()
+                self._response_text_buffer = ""
                 asyncio.create_task(self._gentle_clear(0.15))
 
         elif t == "error":
             error = event.get("error", {})
             logger.error(f"OpenAI error: {error.get('message', 'Unknown')} | {error}")
 
-    def _flush_sentence(self):
-        """Extract complete sentences from the buffer and queue them for TTS."""
-        for sep in [". ", "! ", "? ", ".\n", "!\n", "?\n"]:
-            if sep in self._response_text_buffer:
-                parts = self._response_text_buffer.split(sep, 1)
-                sentence = parts[0] + sep.strip()
-                self._response_text_buffer = parts[1] if len(parts) > 1 else ""
-                if sentence.strip():
-                    logger.info(f"[flush-sentence] {sentence.strip()[:60]}")
-                    self._tts_queue.put_nowait(sentence.strip())
+    def _flush_sentences(self):
+        """Extract ALL complete sentences from the buffer and queue them for TTS."""
+        changed = True
+        while changed:
+            changed = False
+            for sep in [". ", "! ", "? ", ".\n", "!\n", "?\n"]:
+                if sep in self._response_text_buffer:
+                    parts = self._response_text_buffer.split(sep, 1)
+                    sentence = parts[0] + sep.strip()
+                    self._response_text_buffer = parts[1] if len(parts) > 1 else ""
+                    if sentence.strip():
+                        logger.info(f"[flush-sentence] {sentence.strip()[:60]}")
+                        asyncio.get_event_loop().call_soon(
+                            lambda s=sentence.strip(): self._tts_queue.put_nowait(s)
+                            if not self._tts_queue.full() else None
+                        )
+                    changed = True
+                    break
+
+    async def _enqueue_tts(self, text: str):
+        """Enqueue text for TTS with backpressure (bounded queue)."""
+        try:
+            self._tts_queue.put_nowait(text)
+        except asyncio.QueueFull:
+            logger.warning(f"TTS queue full, dropping: {text[:40]}")
+
+    def _drain_tts_queue(self):
+        """Drain all pending TTS items on interruption."""
+        drained = 0
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
                 break
+        if drained:
+            logger.info(f"Drained {drained} items from TTS queue (user interrupted)")
 
     # ── TTS worker (ordered queue) ──────────────────────────
 
@@ -445,9 +476,16 @@ class TwilioRealtimeHandler:
                 text = await self._tts_queue.get()
                 if text is None:
                     break
+                self._tts_playing = True
                 await self._synthesize_tts(text)
+                self._tts_playing = False
+            except asyncio.CancelledError:
+                logger.info("TTS worker cancelled")
+                break
             except Exception as e:
+                self._tts_playing = False
                 logger.error(f"TTS worker error: {e}", exc_info=True)
+        self._tts_playing = False
         logger.info("TTS worker stopped")
 
     async def _synthesize_tts(self, text: str):
@@ -455,7 +493,6 @@ class TwilioRealtimeHandler:
         if not self._twilio_ws or not self.stream_sid:
             return
 
-        # --- ElevenLabs ---
         if self._elevenlabs_tts and self._elevenlabs_available:
             try:
                 mp3_audio = await self._elevenlabs_tts.synthesize(text)
@@ -467,16 +504,12 @@ class TwilioRealtimeHandler:
                 logger.warning(f"ElevenLabs failed — switching to OpenAI TTS: {e}")
                 self._elevenlabs_available = False
 
-        # --- Fallback: streaming OpenAI TTS (PCM → mulaw) ---
         await self._stream_openai_tts(text)
 
     # ── OpenAI streaming TTS ────────────────────────────────
 
     async def _stream_openai_tts(self, text: str):
-        """
-        Stream OpenAI TTS → PCM 24kHz → resample 8kHz → mulaw → Twilio.
-        Streaming means audio starts playing while still generating.
-        """
+        """Stream OpenAI TTS → PCM 24kHz → resample 8kHz → mulaw → Twilio."""
         try:
             if not self._openai_tts_client:
                 self._openai_tts_client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
@@ -485,13 +518,12 @@ class TwilioRealtimeHandler:
                 model=Config.TTS_MODEL,
                 voice=Config.REALTIME_VOICE,
                 input=text,
-                response_format="pcm",  # 24kHz 16-bit mono
+                response_format="pcm",
             ) as response:
                 ratecv_state = None
                 pcm_buffer = b""
                 chunks_sent = 0
-                # 4800 bytes = 100ms at 24kHz 16-bit mono
-                PCM_CHUNK = 4800
+                PCM_CHUNK = 4800  # 100ms at 24kHz 16-bit mono
 
                 async for data in response.iter_bytes(chunk_size=PCM_CHUNK):
                     pcm_buffer += data
@@ -500,18 +532,19 @@ class TwilioRealtimeHandler:
                         pcm_chunk = pcm_buffer[:PCM_CHUNK]
                         pcm_buffer = pcm_buffer[PCM_CHUNK:]
 
-                        # Resample 24kHz → 8kHz (stateful for seamless joins)
                         resampled, ratecv_state = audioop.ratecv(
                             pcm_chunk, 2, 1, 24000, 8000, ratecv_state
                         )
                         mulaw = audioop.lin2ulaw(resampled, 2)
                         mulaw_b64 = base64.b64encode(mulaw).decode("utf-8")
-                        await self._twilio_ws.send_json({
-                            "event": "media",
-                            "streamSid": self.stream_sid,
-                            "media": {"payload": mulaw_b64},
-                        })
-                        chunks_sent += 1
+                        if self._twilio_ws and self.stream_sid:
+                            await self._twilio_ws.send_json({
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {"payload": mulaw_b64},
+                            })
+                            self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
+                            chunks_sent += 1
 
                 # Flush remaining
                 if len(pcm_buffer) >= 2:
@@ -522,12 +555,14 @@ class TwilioRealtimeHandler:
                         )
                         mulaw = audioop.lin2ulaw(resampled, 2)
                         mulaw_b64 = base64.b64encode(mulaw).decode("utf-8")
-                        await self._twilio_ws.send_json({
-                            "event": "media",
-                            "streamSid": self.stream_sid,
-                            "media": {"payload": mulaw_b64},
-                        })
-                        chunks_sent += 1
+                        if self._twilio_ws and self.stream_sid:
+                            await self._twilio_ws.send_json({
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {"payload": mulaw_b64},
+                            })
+                            self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
+                            chunks_sent += 1
 
             logger.info(f"Streamed TTS ({chunks_sent} chunks): {text[:50]}")
 
@@ -538,6 +573,8 @@ class TwilioRealtimeHandler:
 
     async def _send_mulaw_to_twilio(self, mulaw_audio: bytes):
         """Send mulaw audio to Twilio in ~400ms chunks."""
+        if not self._twilio_ws or not self.stream_sid:
+            return
         CHUNK_SIZE = 3200  # 400ms at 8kHz mulaw
         for i in range(0, len(mulaw_audio), CHUNK_SIZE):
             chunk = mulaw_audio[i:i + CHUNK_SIZE]
@@ -548,6 +585,7 @@ class TwilioRealtimeHandler:
                     "streamSid": self.stream_sid,
                     "media": {"payload": chunk_b64},
                 })
+                self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
             except Exception as e:
                 logger.error(f"Error sending chunk to Twilio: {e}")
                 break
@@ -564,18 +602,22 @@ class TwilioRealtimeHandler:
                     "streamSid": self.stream_sid,
                 })
                 logger.debug("Twilio audio cleared gently")
-        except Exception:
+        except asyncio.CancelledError:
             pass
+        except Exception as e:
+            logger.debug(f"Gentle clear failed (likely disconnected): {e}")
 
     # ── Auto-hangup detection ──────────────────────────────
 
     def _contains_goodbye(self, text: str) -> bool:
-        """Check if the AI's response ends with a goodbye."""
-        lower = text.lower().strip().rstrip("!.,")
-        goodbye_words = ["goodbye", "good bye", "bye bye", "bye"]
-        for phrase in goodbye_words:
+        """Check if the AI's response is a clear farewell."""
+        lower = text.lower().strip().rstrip("!.,;")
+        goodbye_phrases = ["goodbye", "good bye", "bye bye", "bye-bye",
+                           "have a great day goodbye", "take care goodbye",
+                           "talk to you later"]
+        for phrase in goodbye_phrases:
             if lower.endswith(phrase):
-                logger.info("Goodbye detected in AI response")
+                logger.info(f"Goodbye detected in AI response: '{phrase}'")
                 return True
         return False
 
@@ -593,15 +635,14 @@ class TwilioRealtimeHandler:
             logger.info("Hangup cancelled — user is still speaking")
 
     async def _hangup_after_delay(self, delay: float):
-        """Wait for AI audio to finish, then hang up. Cancelled if user speaks."""
+        """Wait for AI audio to finish, then hang up. Uses thread to avoid blocking event loop."""
         try:
             logger.info(f"Auto-hangup scheduled in {delay}s (cancels if user speaks)")
             await asyncio.sleep(delay)
 
             if self.call_sid:
-                from twilio.rest import Client as TwilioClient
-                client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-                client.calls(self.call_sid).update(status="completed")
+                # Run synchronous Twilio client in a thread to avoid blocking the event loop
+                await asyncio.to_thread(self._sync_hangup_call, self.call_sid)
                 logger.info(f"Call {self.call_sid} hung up automatically after goodbye")
             else:
                 logger.warning("No call_sid available for auto-hangup")
@@ -610,7 +651,47 @@ class TwilioRealtimeHandler:
         except Exception as e:
             logger.error(f"Auto-hangup failed: {e}")
 
+    @staticmethod
+    def _sync_hangup_call(call_sid: str):
+        """Synchronous Twilio hangup — runs in a thread."""
+        from twilio.rest import Client as TwilioClient
+        client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+        client.calls(call_sid).update(status="completed")
+
     # ── Cleanup ─────────────────────────────────────────────
+
+    async def _full_cleanup(self):
+        """Clean up all resources: TTS worker, hangup task, receive task, OpenAI WS, TTS client."""
+        # Cancel hangup timer
+        self._cancel_hangup()
+
+        # Stop TTS worker
+        if self._tts_worker_task and not self._tts_worker_task.done():
+            self._drain_tts_queue()
+            await self._tts_queue.put(None)  # sentinel
+            try:
+                await asyncio.wait_for(self._tts_worker_task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._tts_worker_task.cancel()
+
+        # Cancel OpenAI receive task
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Close OpenAI WebSocket
+        await self._disconnect_openai()
+
+        # Close OpenAI TTS client
+        if self._openai_tts_client:
+            try:
+                await self._openai_tts_client.close()
+            except Exception:
+                pass
+            self._openai_tts_client = None
 
     async def _disconnect_openai(self):
         """Close the OpenAI WebSocket."""

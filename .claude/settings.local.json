@@ -32,7 +32,11 @@
       "Bash(python:*)",
       "Bash(pip install:*)",
       "Bash(ffmpeg:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(tasklist.exe)",
+      "Bash(taskkill.exe //F //PID 23024)",
+      "Bash(taskkill.exe //F //PID 20960)",
+      "Bash(ngrok version:*)"
     ]
   }
 }

@@ -110,8 +110,8 @@ class WebSocketClient {
      * Send a message to the server
      */
     send(message) {
-        if (!this.isConnected || !this.ws) {
-            console.error('WebSocket not connected');
+        if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected or not open');
             throw new Error('WebSocket not connected');
         }
 
@@ -199,13 +199,14 @@ class WebSocketClient {
             this.messageHandlers['disconnected']();
         }
 
-        // Attempt to reconnect
+        // Attempt to reconnect (preserving the current mode)
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
             this.reconnectAttempts++;
-            console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+            const mode = this.realtimeMode;
+            console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}), realtime=${mode}...`);
 
             setTimeout(() => {
-                this.connect().catch((error) => {
+                this.connect(mode).catch((error) => {
                     console.error('Reconnection failed:', error);
                 });
             }, this.reconnectDelay);
