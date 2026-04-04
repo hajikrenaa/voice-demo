@@ -14,6 +14,7 @@ services:
     build: ./frontend
     container_name: voice-agent-frontend
     ports:
+      - "80:80"
       - "3000:80"
       - "443:443"
     depends_on:
