@@ -25,5 +25,31 @@
     ],
     "goal": "Collect the person's name, intrested in partime working , collect email id to share the details. Confirm all collected info before ending the call politely.",
     "behaviour": "Be warm, polite, and professional. You are the caller \u2014 lead the conversation confidently. Listen carefully to answers. Keep replies to 1-2 short sentences. English only."
+  },
+  {
+    "id": "3e0d74ec",
+    "name": "Test Script",
+    "welcome": "Hello there",
+    "questions": [
+      {
+        "id": "1",
+        "question": "Are you there?"
+      }
+    ],
+    "goal": "Just test",
+    "behaviour": "Friendly"
+  },
+  {
+    "id": "c9c26846",
+    "name": "Test Script",
+    "welcome": "Hello there",
+    "questions": [
+      {
+        "id": "1",
+        "question": "Are you there?"
+      }
+    ],
+    "goal": "Just test",
+    "behaviour": "Friendly"
   }
 ]
