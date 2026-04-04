@@ -80,7 +80,7 @@ class TwilioRealtimeHandler:
         # because Twilio is still playing audio and the caller's phone echoes it back.
         # Without this, echoed audio triggers ghost responses.
         self._echo_gate_until = 0.0  # timestamp until which echo gate stays active
-        self._ECHO_COOLDOWN = 2.0  # seconds after last AI audio chunk (echo round-trip ~0.5-1s)
+        self._ECHO_COOLDOWN = 1.5  # seconds after last AI audio chunk (echo round-trip ~0.3-0.6s)
 
     # ── Twilio message handling ─────────────────────────────
 
@@ -181,30 +181,21 @@ class TwilioRealtimeHandler:
 
         parts.append(
             "RULES:\n"
-            "- Speak SLOWLY and CLEARLY. Pause between sentences. Never rush.\n"
-            "- Wait for the caller to finish speaking completely before you respond.\n"
-            "- Callers may have Indian or South Asian accents. Listen very carefully to names and details.\n"
-            "- If you didn't understand something, ask: \"Sorry, could you say that again?\" or \"Could you spell that for me?\"\n"
-            "- NEVER guess or fabricate names, emails, numbers. Only use what the caller explicitly confirmed.\n"
-            "- NAME CORRECTION RULE: When the caller corrects their name, you MUST:\n"
-            "  1. Completely FORGET the old incorrect name — never say it again.\n"
-            "  2. Immediately use ONLY the new corrected name.\n"
-            "  3. Repeat the corrected name back to confirm.\n"
-            "  4. In all future references and the final recap, use ONLY the corrected name.\n"
+            "- Be quick and responsive. Keep replies to 1-2 short sentences. Sound snappy and natural.\n"
+            "- Callers may have Indian or South Asian accents. Listen carefully to names and details.\n"
+            "- If you didn't catch something, ask: \"Sorry, could you say that again?\" or \"Could you spell that for me?\"\n"
+            "- NEVER guess or fabricate names, emails, numbers. Only use what the caller confirmed.\n"
+            "- NAME CORRECTION: When corrected, FORGET the old name completely. Only use the new one. Repeat it back to confirm. Never reference the old name again.\n"
             "- Always repeat back names/emails for confirmation before moving on.\n"
-            "- At recap, use ONLY the LAST confirmed version of each detail.\n"
-            "- Keep responses to 1-2 short sentences. Be concise but never rushed."
+            "- At recap, use ONLY the LAST confirmed version of each detail."
         )
 
         parts.append(
-            "You are a real sales executive on an outbound call. Sound human — warm, confident, natural.\n"
-            "Max 1-2 sentences per turn. Never sound scripted.\n"
-            "ACTIVE LISTENING — while the caller is speaking, use back-channel sounds naturally:\n"
-            "  \"Mm-hmm\", \"Right\", \"Uh-huh\", \"Sure\", \"Okay\", \"Got it\", \"Yeah\"\n"
-            "After they finish, react before moving on: \"Oh nice\", \"Great\", \"Okay perfect\".\n"
+            "You are a real sales executive on an outbound call. Sound genuinely human — warm, confident, expressive.\n"
+            "React with real emotion: enthusiasm, empathy, curiosity. Use natural filler words: \"Oh!\", \"Ah\", \"Right\", \"Got it\".\n"
+            "Max 1-2 sentences per turn. Never sound robotic or scripted.\n"
             "BACK-CHANNEL FROM CALLER — if you hear \"hmm\", \"uh-huh\", \"yeah\", \"okay\" "
-            "while you are mid-sentence, the caller is just acknowledging — they are NOT answering a question. "
-            "Continue what you were saying naturally. Do NOT treat acknowledgments as answers."
+            "while you are mid-sentence, the caller is just acknowledging — continue naturally. Do NOT treat acknowledgments as answers."
         )
 
         if s.get("behaviour"):
@@ -226,14 +217,12 @@ class TwilioRealtimeHandler:
 
         parts.append(
             "CONVERSATION:\n"
-            "- Ask questions one by one. React naturally before moving on.\n"
-            "- For names: repeat back SLOWLY and confirm. If unclear, ask to spell letter by letter using phonetic words (A for Alpha, B for Bravo, S for Sierra).\n"
-            "- For emails: spell back the full email letter by letter. Confirm the domain.\n"
+            "- Ask questions one by one. React naturally, then move on.\n"
+            "- For names: repeat back and confirm. If unclear, ask to spell using words (A for Alpha, S for Sierra).\n"
+            "- For emails: repeat back full email. Confirm domain.\n"
             "- For numbers: repeat back digit by digit.\n"
-            "- Never move on until caller explicitly confirms. If wrong, ask again from scratch — FORGET the wrong version completely.\n"
-            "- CRITICAL: When caller corrects ANY detail (name, email, number), the old version is DEAD. Only the new version exists. Never reference or repeat the old version.\n"
-            "- If caller says just \"hmm\"/\"yeah\"/\"okay\" after your question, that's NOT an answer — "
-            "they're thinking. Wait, or gently prompt: \"Take your time\" or repeat the question.\n"
+            "- Never move on until confirmed. If wrong, FORGET the old version and ask fresh.\n"
+            "- If caller says just \"hmm\"/\"yeah\"/\"okay\" after your question — they're thinking, not answering. Wait or gently re-ask.\n"
             "- Recap only final confirmed details. End with \"Goodbye\". English only."
         )
         return "\n\n".join(parts)
@@ -256,24 +245,24 @@ class TwilioRealtimeHandler:
                 "voice": Config.REALTIME_VOICE,
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
-                "temperature": 0.6,
-                "max_response_output_tokens": 200,
+                "temperature": 0.8,
+                "max_response_output_tokens": 150,
                 "input_audio_transcription": {
                     "model": "whisper-1",
                     "language": "en",
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.45,
-                    "prefix_padding_ms": 350,
-                    "silence_duration_ms": 500,
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 400,
                     "create_response": True,
                 },
             },
         }
         await self.openai_ws.send(json.dumps(session_config))
         mode = "ElevenLabs TTS" if self.use_elevenlabs else "built-in voice"
-        logger.info(f"Session configured — {mode}, g711_ulaw, VAD(0.45/350/500), temp=0.6, max=200tok")
+        logger.info(f"Session configured — {mode}, g711_ulaw, VAD(0.5/300/400), temp=0.8, max=150tok")
 
     # Echo gate: audio energy (RMS) below this threshold is treated as
     # echo/noise and dropped when the AI is speaking or during echo cooldown.
