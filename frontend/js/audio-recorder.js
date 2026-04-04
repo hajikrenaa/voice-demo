@@ -74,6 +74,13 @@ class AudioRecorder {
      */
     async initialize() {
         try {
+            // Check for Secure Context
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                const err = new Error('Microphone access requires a Secure Context (HTTPS or localhost). Please test locally or configure SSL.');
+                err.name = 'NotSupportedError';
+                throw err;
+            }
+
             // Request microphone access
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
@@ -469,6 +476,13 @@ class AudioRecorder {
      */
     async initializePCMMode() {
         try {
+            // Check for Secure Context
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                const err = new Error('Microphone access requires a Secure Context (HTTPS or localhost). Please test locally or configure SSL.');
+                err.name = 'NotSupportedError';
+                throw err;
+            }
+
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: true,
