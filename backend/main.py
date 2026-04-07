@@ -626,26 +626,15 @@ async def twilio_stream_fallback_get(request: Request):
     return {"error": "Expected WebSocket connection"}
 
 
-# Live call status — updated by Twilio status callbacks
-_call_statuses: dict[str, str] = {}
-
-
 @app.post("/twilio/call-status")
 async def twilio_call_status(request: Request):
-    """Twilio status callback — tracks call lifecycle for frontend polling."""
+    """Twilio status callback — logs call lifecycle events for debugging."""
     form = await request.form()
     call_sid = form.get("CallSid", "?")
     status = form.get("CallStatus", "?")
     duration = form.get("CallDuration", "")
     error_code = form.get("ErrorCode", "")
     error_msg = form.get("ErrorMessage", "")
-
-    _call_statuses[call_sid] = status
-
-    # Clean up old entries (keep max 50)
-    if len(_call_statuses) > 50:
-        oldest = list(_call_statuses.keys())[0]
-        _call_statuses.pop(oldest, None)
 
     if error_code:
         logger.error(f"Call {call_sid}: {status} — ERROR {error_code}: {error_msg}")
@@ -654,13 +643,6 @@ async def twilio_call_status(request: Request):
         logger.info(f"Call {call_sid}: {status}{extra}")
 
     return Response(status_code=204)
-
-
-@app.get("/twilio/call-check/{call_sid}")
-async def get_call_status(call_sid: str):
-    """Frontend polls this to detect when a call ends."""
-    status = _call_statuses.get(call_sid, "unknown")
-    return JSONResponse({"call_sid": call_sid, "status": status})
 
 
 @app.get("/twilio/status")

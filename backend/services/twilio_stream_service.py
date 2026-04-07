@@ -76,8 +76,13 @@ class TwilioRealtimeHandler:
         self._current_ai_transcript = ""
         self._ai_is_responding = False  # True while OpenAI is generating audio
         self._tts_playing = False  # True while TTS audio is being sent to Twilio
+        # Interruption state (manual turn-taking — create_response=false)
+        self._last_interrupted_transcript = ""
+        self._interrupt_pending = False
         self._speech_start_time = 0.0
         self._first_audio_chunk = True
+        self._audio_chunk_count = 0
+        self._response_start_time = 0.0
         # Echo cooldown: keeps the echo gate active AFTER AI finishes generating,
         # because Twilio is still playing audio and the caller's phone echoes it back.
         # Without this, echoed audio triggers ghost responses.
@@ -135,6 +140,7 @@ class TwilioRealtimeHandler:
                 "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1",
             }
+            print(f"[CALL] Connecting to OpenAI Realtime ({model})...", flush=True)
 
             self.openai_ws = await asyncio.wait_for(
                 websockets.connect(
@@ -147,31 +153,43 @@ class TwilioRealtimeHandler:
                 ),
                 timeout=10.0,
             )
-            self._connected = True
-            logger.info(f"Connected to OpenAI Realtime API ({model})")
+            # NOTE: Do NOT set _connected=True yet — audio must not flow until
+            # session config is confirmed (g711_ulaw format active).
+            # Default is pcm16 which causes screeching on Twilio.
+            print(f"[CALL] OpenAI WebSocket connected OK", flush=True)
 
-            await self._configure_session()
+            confirmed = await self._configure_session()
+            if not confirmed:
+                print("[CALL] *** SESSION CONFIG FAILED — aborting ***", flush=True)
+                await self._close_twilio_on_failure("Session config failed")
+                return
+
+            # NOW it's safe to forward audio — format is confirmed g711_ulaw
+            self._connected = True
+            print("[CALL] _connected=True — audio forwarding enabled", flush=True)
             self._receive_task = asyncio.create_task(self._receive_openai_events())
 
             # Trigger the AI to speak first — both inbound and outbound calls.
             await self._trigger_initial_response()
 
         except asyncio.TimeoutError:
-            logger.error("OpenAI Realtime connection timed out (10s)")
+            print("[CALL] *** OpenAI connection TIMED OUT (10s) ***", flush=True)
             self._connected = False
             await self._close_twilio_on_failure("OpenAI connection timed out")
         except Exception as e:
-            logger.error(f"Failed to connect to OpenAI Realtime: {e}")
+            print(f"[CALL] *** OpenAI connection FAILED: {e} ***", flush=True)
             self._connected = False
             await self._close_twilio_on_failure(str(e))
 
     async def _trigger_initial_response(self):
-        """Send response.create so the AI speaks the welcome message immediately."""
+        """Send response.create after a brief delay to let carrier messages finish."""
         try:
+            # Brief pause — just enough for the stream to stabilise
+            await asyncio.sleep(0.5)
             ws = self.openai_ws
             if ws:
                 await ws.send(json.dumps({"type": "response.create"}))
-                logger.info("Triggered initial AI response")
+                logger.info("Triggered initial AI response (after 0.5s delay)")
         except Exception as e:
             logger.error(f"Failed to trigger initial response: {e}")
 
@@ -184,12 +202,11 @@ class TwilioRealtimeHandler:
         parts = []
         n_questions = len(s.get("questions", []))
 
-        # === CRITICAL BEHAVIOR ===
+        # === ROLE + CORE RULES (compact — saves tokens) ===
         parts.append(
-            "You are a real person on a phone call. Warm, natural, confident. English only.\n"
-            "STRICT RULE: Say ONE thing, then STOP and WAIT for the caller to respond.\n"
-            "NEVER say two questions in one turn. NEVER combine questions.\n"
-            "NEVER invent, guess, or fabricate any data the caller did not explicitly say."
+            "You are a real person on a phone call. Sound warm, natural, confident. English only.\n"
+            "Follow the script below EXACTLY. Ask every question in order. 1-2 sentences per reply max.\n"
+            "NEVER skip a question. Ask ALL questions before the recap."
         )
 
         if s.get("behaviour"):
@@ -197,9 +214,7 @@ class TwilioRealtimeHandler:
 
         # === OPENING ===
         if s.get("welcome"):
-            parts.append(
-                f'YOUR FIRST MESSAGE (say this, then STOP and wait):\n"{s["welcome"]}"'
-            )
+            parts.append(f'SAY FIRST: "{s["welcome"]}"')
 
         # === QUESTIONS ===
         questions = s.get("questions", [])
@@ -208,32 +223,36 @@ class TwilioRealtimeHandler:
             for i, q in enumerate(questions):
                 text = q.get("question", q) if isinstance(q, dict) else q
                 q_list.append(f"  Q{i+1}: {text}")
-            parts.append(
-                "QUESTIONS — ask one at a time. After each: STOP, wait for answer, "
-                "react briefly, then ask the next:\n" + "\n".join(q_list)
-            )
+            parts.append("QUESTIONS (one at a time, in order):\n" + "\n".join(q_list))
 
         if s.get("goal"):
             parts.append(f"GOAL: {s['goal']}")
 
-        # === RULES (compact, addresses all known issues) ===
+        # === CONVERSATION RULES (all issues from testing) ===
         parts.append(
             "RULES:\n"
-            "- Ask ONE question → STOP → wait for answer → react → NEXT question.\n"
-            "- If interrupted or caller asks 'why?', answer briefly, then resume from the last UNANSWERED question.\n"
-            "- 'yes'/'yeah'/'correct'/'okay' after you confirm a detail = move on.\n"
-            "- Names: say naturally ('Got it, Hajik Renaa'). NEVER spell letter by letter.\n"
-            "- Emails: say naturally ('hajik at gmail dot com'). NEVER spell character by character.\n"
-            "- If a term sounds unclear, ask them to repeat it.\n"
-            "- If corrected, FORGET the old version completely.\n"
-            f"- RECAP: only after ALL {n_questions} questions are answered and confirmed. "
-            "Keep it brief. Then say Goodbye."
+            "- After caller answers, react briefly ('gotcha', 'nice') then ask the NEXT question.\n"
+            "- Do NOT repeat what the caller just told you. Move forward.\n"
+            "- If caller asks 'why?' — answer briefly, then go to the NEXT scripted question.\n"
+            "- 'yes'/'yeah'/'correct'/'okay' after you repeat a detail = CONFIRMED. Move on.\n"
+            "- Only re-ask if caller says 'no' or gives a correction.\n"
+            "- If a name/term sounds unclear, ask them to repeat or spell it.\n"
+            "- Names: say the full name naturally ('Got it, Hajik Renaa'). Do NOT spell letter by letter.\n"
+            "- Emails: say naturally ('hajik at gmail dot com'). Only spell if unsure.\n"
+            "- If corrected, FORGET the old version. Use only the new one.\n"
+            f"- RECAP: only after ALL {n_questions} questions are answered. Deliver it as one complete "
+            "statement without pausing. Then ask 'Did I get everything right?' and end with Goodbye."
         )
 
         return "\n\n".join(parts)
 
-    async def _configure_session(self):
-        """Configure session — g711_ulaw format, server VAD, tuned for phone accuracy."""
+    async def _configure_session(self) -> bool:
+        """Configure session — g711_ulaw format, VAD, tuned for phone accuracy.
+
+        Returns True if session config was confirmed, False on failure.
+        Critical: g711_ulaw MUST be confirmed before any audio flows,
+        otherwise OpenAI defaults to pcm16 which causes screeching on Twilio.
+        """
         if self.use_elevenlabs:
             modalities = ["text"]
         else:
@@ -242,47 +261,77 @@ class TwilioRealtimeHandler:
         prompt = self._build_prompt()
         logger.info(f"System prompt ({len(prompt)} chars): {prompt[:100]}...")
 
-        # Script mode: lower temp for adherence, more tokens for welcome + questions
-        # Free chat: higher temp for natural variation, fewer tokens for short replies
-        temperature = 0.5 if self._script else 0.8
-        max_tokens = 200 if self._script else 150
+        # Temperature below 0.6 can cause continuous noise/screeching from the model
+        temperature = max(0.7, 0.6 if self._script else 0.8)
+        max_tokens = 200 if self._script else 100
 
-        # Build VAD config — keep it simple, only use validated parameters
+        # Try preferred VAD first, then fall back to server_vad
+        vad_configs = []
         if Config.VAD_TYPE == "semantic_vad":
-            vad_config = {
+            vad_configs.append({
                 "type": "semantic_vad",
                 "eagerness": Config.SEMANTIC_VAD_EAGERNESS,
-            }
-        else:
-            vad_config = {
-                "type": "server_vad",
-                "threshold": Config.VAD_THRESHOLD,
-                "prefix_padding_ms": Config.VAD_PREFIX_PADDING_MS,
-                "silence_duration_ms": Config.VAD_SILENCE_DURATION_MS,
-            }
+            })
+        # Always include server_vad as fallback
+        vad_configs.append({
+            "type": "server_vad",
+            "threshold": Config.VAD_THRESHOLD,
+            "prefix_padding_ms": Config.VAD_PREFIX_PADDING_MS,
+            "silence_duration_ms": Config.VAD_SILENCE_DURATION_MS,
+        })
 
-        session_config = {
-            "type": "session.update",
-            "session": {
-                "modalities": modalities,
-                "instructions": prompt,
-                "voice": Config.REALTIME_VOICE,
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "temperature": temperature,
-                "max_response_output_tokens": max_tokens,
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                    "language": "en",
+        for vad_config in vad_configs:
+            vad_type = vad_config["type"]
+            session_config = {
+                "type": "session.update",
+                "session": {
+                    "modalities": modalities,
+                    "instructions": prompt,
+                    "voice": Config.REALTIME_VOICE,
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "temperature": temperature,
+                    "max_response_output_tokens": max_tokens,
+                    "input_audio_transcription": {
+                        "model": "whisper-1",
+                        "language": "en",
+                    },
+                    "turn_detection": vad_config,
+                    "input_audio_noise_reduction": {
+                        "type": "far_field",
+                    },
                 },
-                "turn_detection": vad_config,
-            },
-        }
-        await self.openai_ws.send(json.dumps(session_config))
+            }
+            print(f"[CALL] Sending session config — g711_ulaw, {vad_type}, temp={temperature}, noise_reduction=far_field", flush=True)
+            await self.openai_ws.send(json.dumps(session_config))
 
-        # Wait for session.updated confirmation — ensures g711_ulaw format is active.
-        # Without this, OpenAI defaults to pcm16 which sounds like screeching on Twilio.
-        confirmed = False
+            confirmed = await self._wait_for_session_confirmation(
+                vad_type, temperature, max_tokens
+            )
+            if confirmed:
+                # Clear any audio that may have buffered during setup
+                try:
+                    await self.openai_ws.send(json.dumps({
+                        "type": "input_audio_buffer.clear",
+                    }))
+                except Exception:
+                    pass
+                return True
+
+            if vad_type != "server_vad":
+                logger.warning(f"{vad_type} failed — retrying with server_vad fallback")
+
+        logger.error("ALL session config attempts failed — audio format is NOT g711_ulaw!")
+        return False
+
+    async def _wait_for_session_confirmation(
+        self, vad_type: str, temperature: float, max_tokens: int
+    ) -> bool:
+        """Wait for session.updated confirmation from OpenAI.
+
+        Returns True ONLY when the response explicitly confirms g711_ulaw
+        audio format.  If the format is wrong the call would screech.
+        """
         try:
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
@@ -291,21 +340,76 @@ class TwilioRealtimeHandler:
                 event = json.loads(raw)
                 etype = event.get("type", "")
                 if etype == "session.updated":
-                    confirmed = True
-                    logger.info(f"Session CONFIRMED — {Config.VAD_TYPE}, g711_ulaw, temp={temperature}, max={max_tokens}tok")
-                    break
+                    # ── CRITICAL: verify the actual audio format ──
+                    session = event.get("session", {})
+                    in_fmt = session.get("input_audio_format", "unknown")
+                    out_fmt = session.get("output_audio_format", "unknown")
+                    print(
+                        f"[CALL] session.updated → input={in_fmt}, output={out_fmt}",
+                        flush=True,
+                    )
+                    if out_fmt != "g711_ulaw":
+                        print(
+                            f"[CALL] *** FORMAT MISMATCH! Got output={out_fmt} "
+                            f"instead of g711_ulaw — this causes screeching! ***",
+                            flush=True,
+                        )
+                        # Try one more session.update to force the format
+                        await self.openai_ws.send(json.dumps({
+                            "type": "session.update",
+                            "session": {
+                                "input_audio_format": "g711_ulaw",
+                                "output_audio_format": "g711_ulaw",
+                            },
+                        }))
+                        # Wait for the corrected confirmation
+                        retry_raw = await asyncio.wait_for(
+                            self.openai_ws.recv(), timeout=3.0
+                        )
+                        retry_event = json.loads(retry_raw)
+                        if retry_event.get("type") == "session.updated":
+                            retry_fmt = retry_event.get("session", {}).get(
+                                "output_audio_format", "unknown"
+                            )
+                            if retry_fmt == "g711_ulaw":
+                                print(
+                                    "[CALL] Format corrected to g711_ulaw on retry",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"[CALL] *** STILL WRONG FORMAT: {retry_fmt} — aborting ***",
+                                    flush=True,
+                                )
+                                return False
+                        else:
+                            print(
+                                "[CALL] *** Retry did not return session.updated — aborting ***",
+                                flush=True,
+                            )
+                            return False
+
+                    mode = "ElevenLabs TTS" if self.use_elevenlabs else "speech-to-speech"
+                    script_mode = "script" if self._script else "free"
+                    print(
+                        f"[CALL] Session CONFIRMED — {mode}, {script_mode}, g711_ulaw, "
+                        f"{vad_type}, temp={temperature}, max={max_tokens}tok",
+                        flush=True,
+                    )
+                    return True
                 elif etype == "error":
                     error = event.get("error", {})
-                    logger.error(f"Session config REJECTED: {error.get('message', 'unknown')}")
-                    break
+                    print(
+                        f"[CALL] *** Session REJECTED ({vad_type}): "
+                        f"{error.get('message', 'unknown')} | code={error.get('code', '?')} ***",
+                        flush=True,
+                    )
+                    return False
                 else:
-                    # Other event (session.created, etc.) — log and keep waiting
                     logger.debug(f"Pre-config event: {etype}")
         except asyncio.TimeoutError:
-            logger.warning("Session config confirmation timed out (5s)")
-
-        if not confirmed:
-            logger.error("Session config NOT confirmed — audio format may be wrong!")
+            logger.error(f"Session config timed out (5s) for {vad_type}")
+        return False
 
     # Simple echo gate: only active while AI is speaking + short cooldown.
     # Catches obvious echo without blocking real speech.
@@ -361,7 +465,7 @@ class TwilioRealtimeHandler:
                 except json.JSONDecodeError:
                     pass
                 except Exception as e:
-                    logger.error(f"Error handling OpenAI event: {e}")
+                    logger.error(f"Error handling OpenAI event: {e}", exc_info=True)
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"OpenAI connection closed: {e}")
         except asyncio.CancelledError:
@@ -384,11 +488,26 @@ class TwilioRealtimeHandler:
         elif t == "response.created":
             self._ai_is_responding = True
             self._first_audio_chunk = True
+            self._audio_chunk_count = 0
+            self._response_start_time = time.monotonic()
 
         elif t == "response.audio.delta":
             audio_b64 = event.get("delta", "")
             if audio_b64 and self._twilio_ws and self.stream_sid:
                 try:
+                    self._audio_chunk_count += 1
+
+                    # Diagnostic logging for first 3 chunks
+                    if self._audio_chunk_count <= 3:
+                        elapsed = time.monotonic() - getattr(self, '_response_start_time', time.monotonic())
+                        raw_bytes = base64.b64decode(audio_b64)
+                        print(
+                            f"[CALL] Audio chunk #{self._audio_chunk_count} → Twilio "
+                            f"({len(audio_b64)} b64 chars, {len(raw_bytes)} bytes, "
+                            f"{elapsed:.2f}s since response.created)",
+                            flush=True,
+                        )
+
                     # Natural pacing: brief pause before first audio chunk
                     if self._first_audio_chunk:
                         self._first_audio_chunk = False
@@ -415,7 +534,7 @@ class TwilioRealtimeHandler:
             if transcript:
                 logger.info(f"AI said: {transcript[:80]}...")
                 if self._contains_goodbye(transcript):
-                    self._schedule_hangup(5.0)
+                    self._schedule_hangup(12.0)
             self._current_ai_transcript = ""
 
         elif t == "response.text.delta":
@@ -432,19 +551,44 @@ class TwilioRealtimeHandler:
                 logger.info(f"[flush-final] {text[:60]}")
                 await self._enqueue_tts(text)
             if full_text and self._contains_goodbye(full_text):
-                self._schedule_hangup(5.0)
+                self._schedule_hangup(12.0)
             self._current_ai_transcript = ""
 
         elif t == "response.done":
             status = event.get("response", {}).get("status", "")
             self._ai_is_responding = False
             if status == "cancelled":
+                # User interrupted — save transcript for recovery, then clear
                 self._response_text_buffer = ""
+                saved_transcript = self._current_ai_transcript.strip()
                 self._current_ai_transcript = ""
                 self._drain_tts_queue()
-                logger.info("Response cancelled (user interrupted)")
+                logger.info(f"Response cancelled — saved: '{saved_transcript[:60]}'")
+                # Inject interrupted context so AI can resume naturally
+                if saved_transcript and len(saved_transcript) > 20:
+                    try:
+                        ws = self.openai_ws
+                        if ws:
+                            await ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "system",
+                                    "content": [{
+                                        "type": "input_text",
+                                        "text": (
+                                            f'[You were interrupted while saying: "{saved_transcript}" '
+                                            f"If relevant, naturally continue after addressing the caller's point.]"
+                                        ),
+                                    }],
+                                },
+                            }))
+                            logger.info("Injected interruption context for AI recovery")
+                    except Exception as e:
+                        logger.debug(f"Could not inject interruption context: {e}")
             else:
                 self._current_ai_transcript = ""
+                logger.debug(f"Response complete (status={status})")
 
         elif t == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
@@ -459,10 +603,15 @@ class TwilioRealtimeHandler:
 
         elif t == "input_audio_buffer.speech_started":
             self._cancel_hangup()
-            self._speech_start_time = time.monotonic()
+            if self._ai_is_responding or self._tts_playing:
+                # User is interrupting — clear Twilio audio buffer
+                logger.info("User interrupted — clearing audio")
+                self._drain_tts_queue()
+                self._response_text_buffer = ""
+                asyncio.create_task(self._gentle_clear(Config.GENTLE_CLEAR_DELAY_MS / 1000.0))
 
         elif t == "input_audio_buffer.speech_stopped":
-            pass  # OpenAI handles turn-taking automatically (create_response=true)
+            pass  # OpenAI handles turn-taking (create_response=true)
 
         elif t == "error":
             error = event.get("error", {})
@@ -650,17 +799,14 @@ class TwilioRealtimeHandler:
     # ── Auto-hangup detection ──────────────────────────────
 
     def _contains_goodbye(self, text: str) -> bool:
-        """Check if the AI's response contains a clear farewell."""
-        lower = text.lower().strip().rstrip("!.,;:)")
-        # Check if response ENDS with any farewell
-        end_phrases = [
-            "goodbye", "good bye", "bye bye", "bye-bye", "bye",
-            "take care", "have a great day", "have a nice day",
-            "have a good one", "talk to you later", "talk soon",
-        ]
-        for phrase in end_phrases:
+        """Check if the AI's response is a clear farewell."""
+        lower = text.lower().strip().rstrip("!.,;")
+        goodbye_phrases = ["goodbye", "good bye", "bye bye", "bye-bye",
+                           "have a great day goodbye", "take care goodbye",
+                           "talk to you later"]
+        for phrase in goodbye_phrases:
             if lower.endswith(phrase):
-                logger.info(f"Goodbye detected: ends with '{phrase}'")
+                logger.info(f"Goodbye detected in AI response: '{phrase}'")
                 return True
         return False
 

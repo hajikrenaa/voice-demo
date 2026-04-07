@@ -20,7 +20,6 @@ let transcript, summaryPanel, summaryContent;
 let volumeIndicator, loadingOverlay, errorToast, errorMessage;
 let voiceSelect, vadThreshold, vadThresholdValue;
 let currentCallSid = null;
-let callPollInterval = null;
 
 /**
  * Authenticated fetch wrapper — adds Authorization header automatically
@@ -1269,7 +1268,6 @@ async function makeOutboundCall() {
             currentCallSid = data.call_sid;
             callStatusText.textContent = `Connected - Call SID: ${data.call_sid.substring(0, 12)}...`;
             addMessageToTranscript('assistant', `Calling ${dialNumber}... AI agent is handling the call.`);
-            startCallStatusPolling(data.call_sid);
         } else {
             throw new Error(data.error || 'Call failed');
         }
@@ -1310,39 +1308,9 @@ async function hangupCall() {
 }
 
 /**
- * Poll Twilio call status — auto-resets dialer when call ends
- */
-function startCallStatusPolling(callSid) {
-    stopCallStatusPolling();
-    callPollInterval = setInterval(async () => {
-        try {
-            const res = await authFetch(`/twilio/call-check/${callSid}`);
-            const data = await res.json();
-            if (data.status === 'completed' || data.status === 'failed' ||
-                data.status === 'busy' || data.status === 'no-answer' ||
-                data.status === 'canceled') {
-                callStatusText.textContent = `Call ended (${data.status})`;
-                addMessageToTranscript('assistant', 'Call ended.');
-                setTimeout(resetDialer, 2000);
-            }
-        } catch (e) {
-            // ignore polling errors
-        }
-    }, 3000);
-}
-
-function stopCallStatusPolling() {
-    if (callPollInterval) {
-        clearInterval(callPollInterval);
-        callPollInterval = null;
-    }
-}
-
-/**
  * Reset dialer UI to idle state
  */
 function resetDialer() {
-    stopCallStatusPolling();
     btnCall.disabled = false;
     btnCall.classList.remove('hidden');
     btnHangup.classList.add('hidden');

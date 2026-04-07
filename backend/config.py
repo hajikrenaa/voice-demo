@@ -84,7 +84,7 @@ class Config:
     ECHO_COOLDOWN_S = float(os.getenv("ECHO_COOLDOWN_S", "1.0"))
 
     # VAD tuning for Realtime API
-    VAD_TYPE = os.getenv("VAD_TYPE", "server_vad")
+    VAD_TYPE = os.getenv("VAD_TYPE", "semantic_vad")
     VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
     VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "300"))
     VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "500"))
