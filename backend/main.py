@@ -33,11 +33,34 @@ _SESSION_TTL = 86400  # 24 hours
 _MAX_SESSIONS = 100
 _active_sessions: dict[str, float] = {}
 
-# Active script — set via /api/script/activate, used by all outbound calls
-_active_script: dict | None = None
-
-# Scripts storage file
+# Scripts storage files
 SCRIPTS_FILE = Path(__file__).parent / "data" / "scripts.json"
+ACTIVE_SCRIPT_FILE = Path(__file__).parent / "data" / "active_script.json"
+
+
+def _load_active_script() -> dict | None:
+    """Load active script from disk (survives server restarts/reloads)."""
+    try:
+        if ACTIVE_SCRIPT_FILE.exists():
+            data = json.loads(ACTIVE_SCRIPT_FILE.read_text(encoding="utf-8"))
+            return data if data else None
+    except Exception:
+        pass
+    return None
+
+
+def _save_active_script(script: dict | None):
+    """Persist active script to disk."""
+    ACTIVE_SCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_SCRIPT_FILE.write_text(json.dumps(script), encoding="utf-8")
+
+
+# Active script — loaded from disk so it survives hot-reloads
+_active_script: dict | None = _load_active_script()
+if _active_script:
+    print(f"[STARTUP] Active script loaded from disk: {_active_script.get('name', 'unnamed')}")
+else:
+    print("[STARTUP] No active script — calls will use default prompt")
 
 
 def _load_scripts() -> list:
@@ -357,6 +380,7 @@ async def activate_script(request: Request):
     global _active_script
     body = await request.json()
     _active_script = body
+    _save_active_script(body)
     logger.info(f"Script activated: welcome='{body.get('welcome', '')[:40]}', {len(body.get('questions', []))} questions")
     return JSONResponse({"success": True, "active": True})
 
@@ -368,6 +392,7 @@ async def deactivate_script(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     global _active_script
     _active_script = None
+    _save_active_script(None)
     logger.info("Script deactivated")
     return JSONResponse({"success": True, "active": False})
 
@@ -441,6 +466,7 @@ async def delete_script(script_id: str, request: Request):
     # Deactivate if this was the active script
     if _active_script and _active_script.get("id") == script_id:
         _active_script = None
+        _save_active_script(None)
 
     logger.info(f"Script deleted: {script_id}")
     return JSONResponse({"success": True})
@@ -470,6 +496,7 @@ async def twilio_voice_webhook(request: Request):
             <Parameter name="elevenlabs" value="{use_elevenlabs}" />
         </Stream>
     </Connect>
+    <Say voice="alice">Sorry, the voice agent disconnected. Please try calling again.</Say>
 </Response>"""
 
     logger.info(f"Twilio voice webhook called, script_active={_active_script is not None}")
@@ -502,10 +529,13 @@ async def make_outbound_call(request: Request):
 
         el = 'true' if use_elevenlabs else 'false'
         voice_url = f"{Config.SERVER_URL}/twilio/voice?elevenlabs={el}"
+        status_cb = f"{Config.SERVER_URL}/twilio/call-status"
         call = client.calls.create(
             to=to_number,
             from_=Config.TWILIO_PHONE_NUMBER,
             url=voice_url,
+            status_callback=status_cb,
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
         )
 
         logger.info(f"Outbound call initiated: {call.sid} to {to_number}")
@@ -562,6 +592,10 @@ async def twilio_media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream WebSocket connected and accepted")
 
+    if _active_script:
+        logger.info(f"Creating handler WITH script: {_active_script.get('name', 'unnamed')} ({len(_active_script.get('questions', []))} questions)")
+    else:
+        logger.info("Creating handler WITHOUT script — using default prompt")
     handler = TwilioRealtimeHandler(active_script=_active_script)
 
     try:
@@ -590,6 +624,43 @@ async def twilio_stream_fallback_get(request: Request):
     """Temporary endpoint to log what headers we're receiving if WebSocket upgrade fails."""
     logger.error(f"Received HTTP GET instead of WebSocket on /ws/twilio-stream. Headers: {dict(request.headers)}")
     return {"error": "Expected WebSocket connection"}
+
+
+# Live call status — updated by Twilio status callbacks
+_call_statuses: dict[str, str] = {}
+
+
+@app.post("/twilio/call-status")
+async def twilio_call_status(request: Request):
+    """Twilio status callback — tracks call lifecycle for frontend polling."""
+    form = await request.form()
+    call_sid = form.get("CallSid", "?")
+    status = form.get("CallStatus", "?")
+    duration = form.get("CallDuration", "")
+    error_code = form.get("ErrorCode", "")
+    error_msg = form.get("ErrorMessage", "")
+
+    _call_statuses[call_sid] = status
+
+    # Clean up old entries (keep max 50)
+    if len(_call_statuses) > 50:
+        oldest = list(_call_statuses.keys())[0]
+        _call_statuses.pop(oldest, None)
+
+    if error_code:
+        logger.error(f"Call {call_sid}: {status} — ERROR {error_code}: {error_msg}")
+    else:
+        extra = f" ({duration}s)" if duration else ""
+        logger.info(f"Call {call_sid}: {status}{extra}")
+
+    return Response(status_code=204)
+
+
+@app.get("/twilio/call-check/{call_sid}")
+async def get_call_status(call_sid: str):
+    """Frontend polls this to detect when a call ends."""
+    status = _call_statuses.get(call_sid, "unknown")
+    return JSONResponse({"call_sid": call_sid, "status": status})
 
 
 @app.get("/twilio/status")
