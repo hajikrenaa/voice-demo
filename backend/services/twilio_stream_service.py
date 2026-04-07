@@ -360,6 +360,8 @@ class TwilioRealtimeHandler:
                     await self._handle_openai_event(event)
                 except json.JSONDecodeError:
                     pass
+                except Exception as e:
+                    logger.error(f"Error handling OpenAI event: {e}")
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"OpenAI connection closed: {e}")
         except asyncio.CancelledError:
@@ -424,7 +426,7 @@ class TwilioRealtimeHandler:
 
         elif t == "response.text.done":
             full_text = event.get("text", "")
-            if self._text_mode and self._response_text_buffer.strip():
+            if self.use_elevenlabs and self._response_text_buffer.strip():
                 text = self._response_text_buffer.strip()
                 self._response_text_buffer = ""
                 logger.info(f"[flush-final] {text[:60]}")
