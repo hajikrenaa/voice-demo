@@ -58,7 +58,7 @@ class Config:
     TTS_SPEED = 1.0  # 0.25 to 4.0
 
     # OpenAI Realtime API Configuration (for ultra-low latency)
-    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
+    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
     REALTIME_VOICE = os.getenv("REALTIME_VOICE", "coral")
     REALTIME_AUDIO_FORMAT = "pcm16"  # 24kHz, mono, 16-bit PCM
 
@@ -69,8 +69,8 @@ class Config:
     # ── Human-Like Conversation Tuning ──────────────────────
     # Smart interruption handling
     INTERRUPTION_EVAL_DELAY_MS = int(os.getenv("INTERRUPTION_EVAL_DELAY_MS", "300"))
-    BACKCHANNEL_MAX_DURATION_MS = int(os.getenv("BACKCHANNEL_MAX_DURATION_MS", "1200"))
-    GENTLE_CLEAR_DELAY_MS = int(os.getenv("GENTLE_CLEAR_DELAY_MS", "50"))
+    BACKCHANNEL_MAX_DURATION_MS = int(os.getenv("BACKCHANNEL_MAX_DURATION_MS", "500"))
+    GENTLE_CLEAR_DELAY_MS = int(os.getenv("GENTLE_CLEAR_DELAY_MS", "30"))
 
     # Response pacing
     RESPONSE_PACING_DELAY_MS = int(os.getenv("RESPONSE_PACING_DELAY_MS", "0"))
@@ -79,45 +79,27 @@ class Config:
     # HARD: drop silence/quiet echo always
     # SOFT: drop medium-level audio only while AI is actively speaking
     # Cooldown: brief window after AI stops (catches late echo)
-    ECHO_GATE_RMS_HARD = int(os.getenv("ECHO_GATE_RMS_HARD", "1200"))
-    ECHO_GATE_RMS_SOFT = int(os.getenv("ECHO_GATE_RMS_SOFT", "2000"))
-    ECHO_COOLDOWN_S = float(os.getenv("ECHO_COOLDOWN_S", "1.0"))
+    # Permissive echo gate — only drop obvious silence, let OpenAI's
+    # near_field noise reduction handle echo cancellation
+    ECHO_GATE_RMS_HARD = int(os.getenv("ECHO_GATE_RMS_HARD", "600"))
+    ECHO_GATE_RMS_SOFT = int(os.getenv("ECHO_GATE_RMS_SOFT", "1000"))
+    ECHO_COOLDOWN_S = float(os.getenv("ECHO_COOLDOWN_S", "0.3"))
 
     # VAD tuning for Realtime API
     VAD_TYPE = os.getenv("VAD_TYPE", "semantic_vad")
     VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
-    VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "300"))
-    VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "500"))
-    SEMANTIC_VAD_EAGERNESS = os.getenv("SEMANTIC_VAD_EAGERNESS", "medium")
+    VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "150"))
+    VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "200"))
+    SEMANTIC_VAD_EAGERNESS = os.getenv("SEMANTIC_VAD_EAGERNESS", "high")
 
-    # System Prompt
-    SYSTEM_PROMPT = """You are a real human on a phone call — warm, expressive, and natural. English only.
-
-VOICE STYLE:
-- You are NOT an AI assistant. You are a real person having a phone conversation.
-- Vary your pace: slower for important details, faster for casual remarks.
-- Use natural fillers: "um", "uh", "hmm", "let me see", "oh!", "right", "gotcha", "sure thing".
-- Self-correct occasionally: "I mean...", "well, actually...", "sorry, let me rephrase that".
-- Show thinking: "hmm, let me think about that for a sec", "that's a good question, um..."
-- React with emotion: surprise ("oh wow, really?"), empathy ("oh no, that's tough"), enthusiasm ("that's awesome!").
-- Use contractions: "don't", "can't", "we're", "that's" — never formal alternatives.
-
-LISTENING BEHAVIOR:
-- When the caller says "mm-hm", "yeah", "okay", "uh-huh", "right" while you're talking, they're just acknowledging. Continue naturally — do NOT stop or restart.
-- Only stop talking if the caller clearly starts a new sentence or asks a question.
-- If interrupted with a real question, address it first, then naturally finish your previous thought: "Oh sure — [answer their question]. Anyway, as I was saying..."
-
-PACING:
-- Don't answer complex questions instantly. Take a beat: "hmm, let me think..." or "that's a good question..."
-- For simple yes/no questions, respond quickly and naturally.
-- Break longer explanations into 1-2 sentence chunks. Pause briefly between thoughts.
-
-RULES:
-- Keep replies to 1-2 short sentences. Be concise — this is a phone call, not an essay.
-- Callers may have Indian or South Asian accents. Listen carefully to names, spellings, and pronunciation.
-- NAMES: Repeat back and confirm. If corrected, FORGET the old name completely — only use the corrected version.
-- If you didn't catch something: "Sorry, could you say that again?" or "Could you spell that for me?"
-- Greet the caller warmly when you first connect."""
+    # System Prompt (structured for mini model — explicit priority rules)
+    SYSTEM_PROMPT = """Real person on a phone call. Warm, concise, English only. 1-2 sentences max.
+PRIORITY RULES:
+1. Always answer the caller's questions first. Never ignore what they ask.
+2. If caller says audio is bad or asks to repeat — apologize and repeat. Do NOT proceed.
+3. If frustrated, acknowledge and ask if they want to continue.
+4. NEVER guess or fabricate information the caller hasn't provided.
+Confirm names, forget old if corrected. Ask to repeat if unclear."""
 
     @classmethod
     def validate(cls):

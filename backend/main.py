@@ -482,8 +482,12 @@ async def delete_script(script_id: str, request: Request):
 _prewarm_openai_task: asyncio.Task | None = None
 
 
-async def _prewarm_openai_connection():
-    """Open an OpenAI Realtime WebSocket so it's ready when the stream starts."""
+async def _prewarm_openai_connection(active_script: dict | None = None, use_elevenlabs: bool = False):
+    """Open an OpenAI Realtime WebSocket and pre-send session config.
+
+    By sending session.update during the pre-warm (while Twilio is still
+    setting up the media stream), we save ~500ms on the first response.
+    """
     model = Config.REALTIME_MODEL
     url = f"{TwilioRealtimeHandler.OPENAI_REALTIME_URL}?model={model}"
     headers = {
@@ -503,6 +507,46 @@ async def _prewarm_openai_connection():
         timeout=10.0,
     )
     logger.info("Pre-warmed OpenAI connection ready")
+
+    # Pre-send session config for the default (non-ElevenLabs) case
+    if not use_elevenlabs:
+        try:
+            temp_handler = TwilioRealtimeHandler(active_script=active_script)
+            prompt = temp_handler._build_prompt()
+            temperature = 0.7 if active_script else 0.8
+            max_tokens = 400 if active_script else 150
+
+            # Build VAD config — try semantic_vad first (matches _configure_session logic)
+            vad_config = {"type": "semantic_vad", "eagerness": Config.SEMANTIC_VAD_EAGERNESS}
+
+            session_config = {
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text", "audio"],
+                    "instructions": prompt,
+                    "voice": Config.REALTIME_VOICE,
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "temperature": temperature,
+                    "max_response_output_tokens": max_tokens,
+                    "input_audio_transcription": {"model": "whisper-1", "language": "en"},
+                    "turn_detection": vad_config,
+                    "input_audio_noise_reduction": {"type": "near_field"},
+                },
+            }
+            await ws.send(json.dumps(session_config))
+            # Don't pre-trigger response — let the caller speak first (say hello)
+            # The model will respond after hearing the caller's voice via VAD
+            logger.info("Pre-sent session config during pre-warm (waiting for caller to speak first)")
+        except Exception as e:
+            logger.warning(f"Failed to pre-send session config: {e} (will cold-connect)")
+            # WebSocket is likely dead after the error — discard it
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return None
+
     return ws
 
 @app.post("/twilio/voice")
@@ -528,10 +572,13 @@ async def twilio_voice_webhook(request: Request):
     <Say voice="alice">Sorry, the voice agent disconnected. Please try calling again.</Say>
 </Response>"""
 
-    # Start OpenAI handshake now — by the time Twilio opens the WebSocket
-    # (~0.6-1s later), the connection will already be established.
+    # Start OpenAI handshake + session config now — by the time Twilio opens
+    # the WebSocket (~0.6-1s later), the session will already be configured.
     global _prewarm_openai_task
-    _prewarm_openai_task = asyncio.create_task(_prewarm_openai_connection())
+    elevenlabs_flag = use_elevenlabs == "true"
+    _prewarm_openai_task = asyncio.create_task(
+        _prewarm_openai_connection(_active_script, elevenlabs_flag)
+    )
 
     logger.info(f"Twilio voice webhook called, script_active={_active_script is not None}")
     logger.info(f"Generated TwiML: {twiml}")
@@ -632,10 +679,11 @@ async def twilio_media_stream(websocket: WebSocket):
         logger.info("Creating handler WITHOUT script — using default prompt")
     handler = TwilioRealtimeHandler(active_script=_active_script)
 
-    # Pass pre-warmed OpenAI connection if available
+    # Pass pre-warmed OpenAI connection (with session config already sent) if available
     global _prewarm_openai_task
     if _prewarm_openai_task:
         handler._prewarm_task = _prewarm_openai_task
+        handler._session_preconfigured = True
         _prewarm_openai_task = None
 
     try:

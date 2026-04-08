@@ -40,7 +40,12 @@
       "WebSearch",
       "Bash(netstat -ano)",
       "Bash(pip list:*)",
-      "Bash(docker-compose up:*)"
+      "Bash(docker-compose up:*)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:openai.com)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:www.eesel.ai)",
+      "WebFetch(domain:the-rogue-marketing.github.io)"
     ]
   }
 }
