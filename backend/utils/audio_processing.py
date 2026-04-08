@@ -1,6 +1,9 @@
 import io
 import base64
+
+import numpy as np
 from pydub import AudioSegment
+
 from config import Config
 
 
@@ -209,3 +212,29 @@ def preprocess_audio_for_whisper(audio_bytes: bytes, source_format: str = "webm"
         raise ValueError("Audio validation failed: too short or too quiet")
 
     return normalized_audio
+
+
+# ── Pre-computed FIR low-pass filter for 24kHz → 8kHz downsampling ──────
+# Windowed-sinc at 4 kHz cutoff (Nyquist of target rate), 31 taps.
+# Built once at import time so every call is just convolve + slice.
+_FIR_N = 31
+_FIR_FC = 4000 / 24000  # normalised cutoff
+_t = np.arange(-(_FIR_N - 1) // 2, (_FIR_N - 1) // 2 + 1)
+_LP_FILTER = (np.sinc(2 * _FIR_FC * _t) * np.hamming(_FIR_N)).astype(np.float32)
+_LP_FILTER /= _LP_FILTER.sum()
+
+
+def downsample_24k_to_8k(pcm_data: bytes) -> bytes:
+    """Downsample 24 kHz PCM-16 to 8 kHz PCM-16 with anti-aliasing.
+
+    Applies a 31-tap windowed-sinc low-pass filter before decimation to
+    suppress aliasing artifacts that audioop.ratecv would introduce.
+    Stateless — safe to call on independent streaming chunks (boundary
+    artefacts are ~0.6 ms, inaudible for speech).
+    """
+    samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
+    if len(samples) < 3:
+        return b""
+    filtered = np.convolve(samples, _LP_FILTER, mode="same")
+    downsampled = filtered[::3]
+    return np.clip(downsampled, -32768, 32767).astype(np.int16).tobytes()

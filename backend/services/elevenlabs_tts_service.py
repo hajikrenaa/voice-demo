@@ -32,12 +32,12 @@ class ElevenLabsTTSService:
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
-        url = f"{self.API_URL}/{self.voice_id}"
+        url = f"{self.API_URL}/{self.voice_id}?output_format=ulaw_8000"
 
         headers = {
             "xi-api-key": self.api_key,
             "Content-Type": "application/json",
-            "Accept": "audio/mpeg",
+            "Accept": "audio/basic",
         }
 
         payload = {
@@ -74,12 +74,12 @@ class ElevenLabsTTSService:
         if not text or not text.strip():
             return
 
-        url = f"{self.API_URL}/{self.voice_id}/stream"
+        url = f"{self.API_URL}/{self.voice_id}/stream?output_format=ulaw_8000"
 
         headers = {
             "xi-api-key": self.api_key,
             "Content-Type": "application/json",
-            "Accept": "audio/mpeg",
+            "Accept": "audio/basic",
         }
 
         payload = {

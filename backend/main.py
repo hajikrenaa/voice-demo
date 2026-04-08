@@ -11,6 +11,7 @@ import json
 import uuid
 import time
 import secrets
+import websockets
 from pathlib import Path
 from html import escape as html_escape
 
@@ -476,6 +477,34 @@ async def delete_script(script_id: str, request: Request):
 # Twilio Voice Calling Endpoints
 # ==========================================
 
+# Pre-warmed OpenAI connection — started at TwiML time, consumed by the
+# WebSocket handler ~0.6-1s later so the handshake is already done.
+_prewarm_openai_task: asyncio.Task | None = None
+
+
+async def _prewarm_openai_connection():
+    """Open an OpenAI Realtime WebSocket so it's ready when the stream starts."""
+    model = Config.REALTIME_MODEL
+    url = f"{TwilioRealtimeHandler.OPENAI_REALTIME_URL}?model={model}"
+    headers = {
+        "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+    logger.info("Pre-warming OpenAI Realtime connection...")
+    ws = await asyncio.wait_for(
+        websockets.connect(
+            url,
+            additional_headers=headers,
+            ping_interval=30,
+            ping_timeout=10,
+            max_size=2**20,
+            compression=None,
+        ),
+        timeout=10.0,
+    )
+    logger.info("Pre-warmed OpenAI connection ready")
+    return ws
+
 @app.post("/twilio/voice")
 async def twilio_voice_webhook(request: Request):
     """
@@ -498,6 +527,11 @@ async def twilio_voice_webhook(request: Request):
     </Connect>
     <Say voice="alice">Sorry, the voice agent disconnected. Please try calling again.</Say>
 </Response>"""
+
+    # Start OpenAI handshake now — by the time Twilio opens the WebSocket
+    # (~0.6-1s later), the connection will already be established.
+    global _prewarm_openai_task
+    _prewarm_openai_task = asyncio.create_task(_prewarm_openai_connection())
 
     logger.info(f"Twilio voice webhook called, script_active={_active_script is not None}")
     logger.info(f"Generated TwiML: {twiml}")
@@ -597,6 +631,12 @@ async def twilio_media_stream(websocket: WebSocket):
     else:
         logger.info("Creating handler WITHOUT script — using default prompt")
     handler = TwilioRealtimeHandler(active_script=_active_script)
+
+    # Pass pre-warmed OpenAI connection if available
+    global _prewarm_openai_task
+    if _prewarm_openai_task:
+        handler._prewarm_task = _prewarm_openai_task
+        _prewarm_openai_task = None
 
     try:
         async for raw_message in websocket.iter_text():

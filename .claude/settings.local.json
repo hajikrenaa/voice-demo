@@ -38,7 +38,9 @@
       "Bash(taskkill.exe //F //PID 20960)",
       "Bash(ngrok version:*)",
       "WebSearch",
-      "Bash(netstat -ano)"
+      "Bash(netstat -ano)",
+      "Bash(pip list:*)",
+      "Bash(docker-compose up:*)"
     ]
   }
 }

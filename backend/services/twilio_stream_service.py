@@ -1,23 +1,23 @@
 """
-Twilio Bidirectional Media Stream — OpenAI Realtime API
+Twilio Bidirectional Media Stream -- OpenAI Realtime API
 
 Ultra-low latency voice agent.
 
-Mode 1 (ElevenLabs OFF — default):
+Mode 1 (ElevenLabs OFF -- default):
   Twilio mulaw 8kHz ──► g711_ulaw ──► OpenAI Realtime (speech-to-speech)
   Twilio mulaw 8kHz ◄── g711_ulaw ◄──┘
-  Zero audio conversion. ~300ms latency.
+  Zero audio conversion on both input AND output. ~300ms latency.
 
 Mode 2 (ElevenLabs ON):
   Twilio mulaw 8kHz ──► g711_ulaw ──► OpenAI Realtime (text-only response)
                                             │ text (sentence-streamed)
-  Twilio mulaw 8kHz ◄── PCM→mulaw  ◄── TTS streaming (ElevenLabs or OpenAI)
+  Twilio mulaw 8kHz ◄── ulaw_8000 (native) ◄── ElevenLabs streaming
+  Twilio mulaw 8kHz ◄── PCM->mulaw          ◄── OpenAI TTS fallback
 """
 
 import asyncio
 import audioop
 import base64
-import io
 import json
 import logging
 import time
@@ -25,30 +25,23 @@ from typing import Optional
 
 import websockets
 from openai import AsyncOpenAI
-from pydub import AudioSegment
 
 from config import Config
 from services.elevenlabs_tts_service import ElevenLabsTTSService
+from utils.audio_processing import downsample_24k_to_8k
 
 logger = logging.getLogger(__name__)
 
 
-def mp3_to_mulaw(mp3_bytes: bytes) -> bytes:
-    """Convert mp3 audio to raw mulaw 8kHz for Twilio."""
-    audio = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
-    audio = audio.set_channels(1).set_frame_rate(8000).set_sample_width(2)
-    return audioop.lin2ulaw(audio.raw_data, 2)
-
-
 class TwilioRealtimeHandler:
     """
-    Bridges Twilio ↔ OpenAI Realtime API.
+    Bridges Twilio <-> OpenAI Realtime API.
 
     When use_elevenlabs=False:
-      - g711_ulaw in/out — zero conversion, ~300ms latency.
+      - g711_ulaw in/out -- zero conversion, ~300ms latency.
     When use_elevenlabs=True:
       - g711_ulaw input, text output from OpenAI
-      - Sentence-by-sentence → TTS streaming → mulaw → Twilio
+      - Sentence-by-sentence -> TTS streaming -> mulaw -> Twilio
       - Uses ordered queue so sentences never overlap or reorder.
     """
 
@@ -76,13 +69,17 @@ class TwilioRealtimeHandler:
         self._current_ai_transcript = ""
         self._ai_is_responding = False  # True while OpenAI is generating audio
         self._tts_playing = False  # True while TTS audio is being sent to Twilio
-        # Interruption state (manual turn-taking — create_response=false)
+        # Interruption state (manual turn-taking -- create_response=false)
         self._last_interrupted_transcript = ""
         self._interrupt_pending = False
         self._speech_start_time = 0.0
         self._first_audio_chunk = True
         self._audio_chunk_count = 0
         self._response_start_time = 0.0
+        # PCM16 buffer for accumulating audio chunks before conversion
+        self._pcm_buffer = b""
+        # Pre-warmed OpenAI WebSocket (set externally before start event)
+        self._prewarm_task: Optional[asyncio.Task] = None
         # Echo cooldown: keeps the echo gate active AFTER AI finishes generating,
         # because Twilio is still playing audio and the caller's phone echoes it back.
         # Without this, echoed audio triggers ghost responses.
@@ -132,44 +129,62 @@ class TwilioRealtimeHandler:
     # ── OpenAI Realtime connection ──────────────────────────
 
     async def _connect_openai(self):
-        """Connect to OpenAI Realtime API with a connection timeout."""
-        try:
-            model = Config.REALTIME_MODEL
-            url = f"{self.OPENAI_REALTIME_URL}?model={model}"
-            headers = {
-                "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1",
-            }
-            print(f"[CALL] Connecting to OpenAI Realtime ({model})...", flush=True)
+        """Connect to OpenAI Realtime API with a connection timeout.
 
-            self.openai_ws = await asyncio.wait_for(
-                websockets.connect(
-                    url,
-                    additional_headers=headers,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    max_size=2**20,
-                    compression=None,
-                ),
-                timeout=10.0,
-            )
-            # NOTE: Do NOT set _connected=True yet — audio must not flow until
+        If a pre-warmed WebSocket was started at TwiML time, await it
+        instead of opening a cold connection — saves ~1s of handshake.
+        """
+        try:
+            if self._prewarm_task:
+                # Use the connection that was started at TwiML webhook time
+                print("[CALL] Awaiting pre-warmed OpenAI connection...", flush=True)
+                try:
+                    self.openai_ws = await asyncio.wait_for(
+                        self._prewarm_task, timeout=10.0
+                    )
+                except Exception as e:
+                    print(f"[CALL] Pre-warm failed ({e}), cold-connecting...", flush=True)
+                    self.openai_ws = None
+                finally:
+                    self._prewarm_task = None
+
+            if not self.openai_ws:
+                model = Config.REALTIME_MODEL
+                url = f"{self.OPENAI_REALTIME_URL}?model={model}"
+                headers = {
+                    "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1",
+                }
+                print(f"[CALL] Connecting to OpenAI Realtime ({model})...", flush=True)
+
+                self.openai_ws = await asyncio.wait_for(
+                    websockets.connect(
+                        url,
+                        additional_headers=headers,
+                        ping_interval=30,
+                        ping_timeout=10,
+                        max_size=2**20,
+                        compression=None,
+                    ),
+                    timeout=10.0,
+                )
+
+            # NOTE: Do NOT set _connected=True yet -- audio must not flow until
             # session config is confirmed (g711_ulaw format active).
-            # Default is pcm16 which causes screeching on Twilio.
             print(f"[CALL] OpenAI WebSocket connected OK", flush=True)
 
             confirmed = await self._configure_session()
             if not confirmed:
-                print("[CALL] *** SESSION CONFIG FAILED — aborting ***", flush=True)
+                print("[CALL] *** SESSION CONFIG FAILED -- aborting ***", flush=True)
                 await self._close_twilio_on_failure("Session config failed")
                 return
 
-            # NOW it's safe to forward audio — format is confirmed g711_ulaw
+            # NOW it's safe to forward audio -- format is confirmed g711_ulaw
             self._connected = True
-            print("[CALL] _connected=True — audio forwarding enabled", flush=True)
+            print("[CALL] _connected=True -- audio forwarding enabled", flush=True)
             self._receive_task = asyncio.create_task(self._receive_openai_events())
 
-            # Trigger the AI to speak first — both inbound and outbound calls.
+            # Trigger the AI to speak first -- both inbound and outbound calls.
             await self._trigger_initial_response()
 
         except asyncio.TimeoutError:
@@ -182,14 +197,12 @@ class TwilioRealtimeHandler:
             await self._close_twilio_on_failure(str(e))
 
     async def _trigger_initial_response(self):
-        """Send response.create after a brief delay to let carrier messages finish."""
+        """Send response.create immediately to start the welcome message."""
         try:
-            # Brief pause — just enough for the stream to stabilise
-            await asyncio.sleep(0.5)
             ws = self.openai_ws
             if ws:
                 await ws.send(json.dumps({"type": "response.create"}))
-                logger.info("Triggered initial AI response (after 0.5s delay)")
+                logger.info("Triggered initial AI response")
         except Exception as e:
             logger.error(f"Failed to trigger initial response: {e}")
 
@@ -202,7 +215,7 @@ class TwilioRealtimeHandler:
         parts = []
         n_questions = len(s.get("questions", []))
 
-        # === ROLE + CORE RULES (compact — saves tokens) ===
+        # === ROLE + CORE RULES (compact -- saves tokens) ===
         parts.append(
             "You are a real person on a phone call. Sound warm, natural, confident. English only.\n"
             "Follow the script below EXACTLY. Ask every question in order. 1-2 sentences per reply max.\n"
@@ -233,21 +246,27 @@ class TwilioRealtimeHandler:
             "RULES:\n"
             "- After caller answers, react briefly ('gotcha', 'nice') then ask the NEXT question.\n"
             "- Do NOT repeat what the caller just told you. Move forward.\n"
-            "- If caller asks 'why?' — answer briefly, then go to the NEXT scripted question.\n"
+            "- If caller asks 'why?' -- answer briefly, then go to the NEXT scripted question.\n"
             "- 'yes'/'yeah'/'correct'/'okay' after you repeat a detail = CONFIRMED. Move on.\n"
             "- Only re-ask if caller says 'no' or gives a correction.\n"
             "- If a name/term sounds unclear, ask them to repeat or spell it.\n"
-            "- Names: say the full name naturally ('Got it, Hajik Renaa'). Do NOT spell letter by letter.\n"
+            "- NEVER spell names letter by letter. Always say the full name naturally ('Got it, Hajik Renaa'). "
+            "Even if the caller spelled it for you, just confirm the name as a whole word.\n"
             "- Emails: say naturally ('hajik at gmail dot com'). Only spell if unsure.\n"
             "- If corrected, FORGET the old version. Use only the new one.\n"
-            f"- RECAP: only after ALL {n_questions} questions are answered. Deliver it as one complete "
-            "statement without pausing. Then ask 'Did I get everything right?' and end with Goodbye."
+            "- Tool names, frameworks, libraries: NEVER guess or substitute. If a tool name sounds "
+            "unclear, ask 'Could you spell that tool name for me?' Do NOT fill in a similar-sounding name.\n"
+            "- If the caller sounds hesitant ('kind of', 'I guess', 'not really'), acknowledge it: "
+            "'No worries, I can call back at a better time if you prefer.' Don't treat it as a yes.\n"
+            f"- RECAP: only after ALL {n_questions} questions are answered. Deliver the entire recap as one "
+            "complete uninterrupted statement covering every detail collected. Then ask 'Did I get everything "
+            "right?' and end with Goodbye."
         )
 
         return "\n\n".join(parts)
 
     async def _configure_session(self) -> bool:
-        """Configure session — g711_ulaw format, VAD, tuned for phone accuracy.
+        """Configure session -- g711_ulaw format, VAD, tuned for phone accuracy.
 
         Returns True if session config was confirmed, False on failure.
         Critical: g711_ulaw MUST be confirmed before any audio flows,
@@ -263,7 +282,7 @@ class TwilioRealtimeHandler:
 
         # Temperature below 0.6 can cause continuous noise/screeching from the model
         temperature = max(0.7, 0.6 if self._script else 0.8)
-        max_tokens = 200 if self._script else 100
+        max_tokens = 500 if self._script else 100
 
         # Try preferred VAD first, then fall back to server_vad
         vad_configs = []
@@ -282,6 +301,9 @@ class TwilioRealtimeHandler:
 
         for vad_config in vad_configs:
             vad_type = vad_config["type"]
+            # For speech-to-speech (no ElevenLabs): use g711_ulaw output -- zero conversion, no screeching
+            # For ElevenLabs mode: use pcm16 output (text-only modality, TTS handled separately)
+            output_format = "pcm16" if self.use_elevenlabs else "g711_ulaw"
             session_config = {
                 "type": "session.update",
                 "session": {
@@ -289,7 +311,7 @@ class TwilioRealtimeHandler:
                     "instructions": prompt,
                     "voice": Config.REALTIME_VOICE,
                     "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
+                    "output_audio_format": output_format,
                     "temperature": temperature,
                     "max_response_output_tokens": max_tokens,
                     "input_audio_transcription": {
@@ -302,7 +324,7 @@ class TwilioRealtimeHandler:
                     },
                 },
             }
-            print(f"[CALL] Sending session config — g711_ulaw, {vad_type}, temp={temperature}, noise_reduction=far_field", flush=True)
+            print(f"[CALL] Sending session config -- input=g711_ulaw, output={output_format}, {vad_type}, temp={temperature}", flush=True)
             await self.openai_ws.send(json.dumps(session_config))
 
             confirmed = await self._wait_for_session_confirmation(
@@ -319,9 +341,9 @@ class TwilioRealtimeHandler:
                 return True
 
             if vad_type != "server_vad":
-                logger.warning(f"{vad_type} failed — retrying with server_vad fallback")
+                logger.warning(f"{vad_type} failed -- retrying with server_vad fallback")
 
-        logger.error("ALL session config attempts failed — audio format is NOT g711_ulaw!")
+        logger.error("ALL session config attempts failed -- audio format is NOT g711_ulaw!")
         return False
 
     async def _wait_for_session_confirmation(
@@ -344,14 +366,15 @@ class TwilioRealtimeHandler:
                     session = event.get("session", {})
                     in_fmt = session.get("input_audio_format", "unknown")
                     out_fmt = session.get("output_audio_format", "unknown")
+                    expected_out = "pcm16" if self.use_elevenlabs else "g711_ulaw"
                     print(
-                        f"[CALL] session.updated → input={in_fmt}, output={out_fmt}",
+                        f"[CALL] session.updated -> input={in_fmt}, output={out_fmt} (expected={expected_out})",
                         flush=True,
                     )
-                    if out_fmt != "g711_ulaw":
+                    if out_fmt != expected_out:
                         print(
                             f"[CALL] *** FORMAT MISMATCH! Got output={out_fmt} "
-                            f"instead of g711_ulaw — this causes screeching! ***",
+                            f"instead of {expected_out} -- retrying ***",
                             flush=True,
                         )
                         # Try one more session.update to force the format
@@ -359,7 +382,7 @@ class TwilioRealtimeHandler:
                             "type": "session.update",
                             "session": {
                                 "input_audio_format": "g711_ulaw",
-                                "output_audio_format": "g711_ulaw",
+                                "output_audio_format": expected_out,
                             },
                         }))
                         # Wait for the corrected confirmation
@@ -371,20 +394,20 @@ class TwilioRealtimeHandler:
                             retry_fmt = retry_event.get("session", {}).get(
                                 "output_audio_format", "unknown"
                             )
-                            if retry_fmt == "g711_ulaw":
+                            if retry_fmt == expected_out:
                                 print(
-                                    "[CALL] Format corrected to g711_ulaw on retry",
+                                    f"[CALL] Format corrected to {expected_out} on retry",
                                     flush=True,
                                 )
                             else:
                                 print(
-                                    f"[CALL] *** STILL WRONG FORMAT: {retry_fmt} — aborting ***",
+                                    f"[CALL] *** STILL WRONG FORMAT: {retry_fmt} -- aborting ***",
                                     flush=True,
                                 )
                                 return False
                         else:
                             print(
-                                "[CALL] *** Retry did not return session.updated — aborting ***",
+                                "[CALL] *** Retry did not return session.updated -- aborting ***",
                                 flush=True,
                             )
                             return False
@@ -392,7 +415,7 @@ class TwilioRealtimeHandler:
                     mode = "ElevenLabs TTS" if self.use_elevenlabs else "speech-to-speech"
                     script_mode = "script" if self._script else "free"
                     print(
-                        f"[CALL] Session CONFIRMED — {mode}, {script_mode}, g711_ulaw, "
+                        f"[CALL] Session CONFIRMED -- {mode}, {script_mode}, in={in_fmt}, out={out_fmt}, "
                         f"{vad_type}, temp={temperature}, max={max_tokens}tok",
                         flush=True,
                     )
@@ -413,7 +436,7 @@ class TwilioRealtimeHandler:
 
     # Simple echo gate: only active while AI is speaking + short cooldown.
     # Catches obvious echo without blocking real speech.
-    # OpenAI's semantic VAD handles noisy environments — we just prevent echo loops.
+    # OpenAI's semantic VAD handles noisy environments -- we just prevent echo loops.
 
     def _is_echo_gate_active(self) -> bool:
         """Check if echo gate should be filtering audio right now."""
@@ -424,9 +447,9 @@ class TwilioRealtimeHandler:
         return False
 
     async def _forward_audio(self, mulaw_b64: str):
-        """Forward Twilio mulaw 8kHz directly to OpenAI (g711_ulaw — zero conversion).
+        """Forward Twilio mulaw 8kHz directly to OpenAI (g711_ulaw -- zero conversion).
 
-        Light echo gate — only checks RMS while AI is speaking.
+        Light echo gate -- only checks RMS while AI is speaking.
         Passes everything through when AI is silent (zero overhead).
         """
         try:
@@ -490,8 +513,13 @@ class TwilioRealtimeHandler:
             self._first_audio_chunk = True
             self._audio_chunk_count = 0
             self._response_start_time = time.monotonic()
+            # Reset PCM buffer for each new response
+            self._pcm_buffer = b""
 
         elif t == "response.audio.delta":
+            # Audio from OpenAI -> forward to Twilio
+            # g711_ulaw mode: already mulaw, forward directly (zero conversion!)
+            # pcm16 mode (ElevenLabs): convert PCM16 24kHz -> mulaw 8kHz
             audio_b64 = event.get("delta", "")
             if audio_b64 and self._twilio_ws and self.stream_sid:
                 try:
@@ -499,11 +527,12 @@ class TwilioRealtimeHandler:
 
                     # Diagnostic logging for first 3 chunks
                     if self._audio_chunk_count <= 3:
-                        elapsed = time.monotonic() - getattr(self, '_response_start_time', time.monotonic())
-                        raw_bytes = base64.b64decode(audio_b64)
+                        elapsed = time.monotonic() - self._response_start_time
+                        raw_data = base64.b64decode(audio_b64)
+                        fmt = "mulaw" if not self.use_elevenlabs else "PCM16"
                         print(
-                            f"[CALL] Audio chunk #{self._audio_chunk_count} → Twilio "
-                            f"({len(audio_b64)} b64 chars, {len(raw_bytes)} bytes, "
+                            f"[CALL] Audio chunk #{self._audio_chunk_count} "
+                            f"({len(raw_data)} {fmt} bytes, "
                             f"{elapsed:.2f}s since response.created)",
                             flush=True,
                         )
@@ -515,13 +544,35 @@ class TwilioRealtimeHandler:
                         if pacing_ms > 0:
                             await asyncio.sleep(pacing_ms / 1000.0)
 
-                    await self._twilio_ws.send_json({
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {"payload": audio_b64},
-                    })
-                    # Refresh echo cooldown — Twilio buffers and plays this audio,
-                    # and the caller's phone will echo it back ~1-3s later.
+                    if not self.use_elevenlabs:
+                        # g711_ulaw output -> forward directly to Twilio (ZERO conversion)
+                        await self._twilio_ws.send_json({
+                            "event": "media",
+                            "streamSid": self.stream_sid,
+                            "media": {"payload": audio_b64},
+                        })
+                    else:
+                        # pcm16 output -> buffer and convert to mulaw for Twilio
+                        pcm_data = base64.b64decode(audio_b64)
+                        self._pcm_buffer += pcm_data
+                        PCM_CHUNK = 4800  # 100ms at 24kHz 16-bit mono
+
+                        while len(self._pcm_buffer) >= PCM_CHUNK:
+                            chunk = self._pcm_buffer[:PCM_CHUNK]
+                            self._pcm_buffer = self._pcm_buffer[PCM_CHUNK:]
+
+                            # Anti-aliased downsample 24kHz -> 8kHz, then PCM16 -> mulaw
+                            resampled = downsample_24k_to_8k(chunk)
+                            mulaw = audioop.lin2ulaw(resampled, 2)
+                            mulaw_b64_chunk = base64.b64encode(mulaw).decode("utf-8")
+
+                            await self._twilio_ws.send_json({
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {"payload": mulaw_b64_chunk},
+                            })
+
+                    # Refresh echo cooldown
                     self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
                 except Exception as e:
                     logger.error(f"Error sending audio to Twilio: {e}")
@@ -556,14 +607,17 @@ class TwilioRealtimeHandler:
 
         elif t == "response.done":
             status = event.get("response", {}).get("status", "")
+            # Flush any remaining PCM audio buffer (only relevant in pcm16/ElevenLabs mode)
+            if self.use_elevenlabs:
+                await self._flush_pcm_remainder()
             self._ai_is_responding = False
             if status == "cancelled":
-                # User interrupted — save transcript for recovery, then clear
+                # User interrupted -- save transcript for recovery, then clear
                 self._response_text_buffer = ""
                 saved_transcript = self._current_ai_transcript.strip()
                 self._current_ai_transcript = ""
                 self._drain_tts_queue()
-                logger.info(f"Response cancelled — saved: '{saved_transcript[:60]}'")
+                logger.info(f"Response cancelled -- saved: '{saved_transcript[:60]}'")
                 # Inject interrupted context so AI can resume naturally
                 if saved_transcript and len(saved_transcript) > 20:
                     try:
@@ -595,7 +649,7 @@ class TwilioRealtimeHandler:
             if transcript:
                 logger.info(f"User said: \"{transcript}\"")
             else:
-                logger.warning("User audio transcription was EMPTY — likely garbled or too quiet")
+                logger.warning("User audio transcription was EMPTY -- likely garbled or too quiet")
 
         elif t == "conversation.item.input_audio_transcription.failed":
             error = event.get("error", {})
@@ -604,8 +658,8 @@ class TwilioRealtimeHandler:
         elif t == "input_audio_buffer.speech_started":
             self._cancel_hangup()
             if self._ai_is_responding or self._tts_playing:
-                # User is interrupting — clear Twilio audio buffer
-                logger.info("User interrupted — clearing audio")
+                # User is interrupting -- clear Twilio audio buffer
+                logger.info("User interrupted -- clearing audio")
                 self._drain_tts_queue()
                 self._response_text_buffer = ""
                 asyncio.create_task(self._gentle_clear(Config.GENTLE_CLEAR_DELAY_MS / 1000.0))
@@ -658,7 +712,7 @@ class TwilioRealtimeHandler:
     # ── TTS worker (ordered queue) ──────────────────────────
 
     async def _tts_worker(self):
-        """Process TTS queue sequentially — sentences play in order."""
+        """Process TTS queue sequentially -- sentences play in order."""
         logger.info("TTS worker started")
         while True:
             try:
@@ -678,27 +732,66 @@ class TwilioRealtimeHandler:
         logger.info("TTS worker stopped")
 
     async def _synthesize_tts(self, text: str):
-        """Try ElevenLabs first, fall back to streaming OpenAI TTS."""
+        """Try ElevenLabs streaming first, fall back to streaming OpenAI TTS."""
         if not self._twilio_ws or not self.stream_sid:
             return
 
         if self._elevenlabs_tts and self._elevenlabs_available:
             try:
-                mp3_audio = await self._elevenlabs_tts.synthesize(text)
-                logger.info(f"ElevenLabs OK ({len(mp3_audio)} bytes): {text[:50]}")
-                mulaw = mp3_to_mulaw(mp3_audio)
-                await self._send_mulaw_to_twilio(mulaw)
+                await self._stream_elevenlabs_tts(text)
                 return
             except Exception as e:
-                logger.warning(f"ElevenLabs failed — switching to OpenAI TTS: {e}")
+                logger.warning(f"ElevenLabs failed -- switching to OpenAI TTS: {e}")
                 self._elevenlabs_available = False
 
         await self._stream_openai_tts(text)
 
-    # ── OpenAI streaming TTS ────────────────────────────────
+    # ── ElevenLabs streaming TTS (native ulaw) ─────────────
+
+    async def _stream_elevenlabs_tts(self, text: str):
+        """Stream ElevenLabs TTS -> ulaw_8000 (native) -> Twilio.
+
+        ElevenLabs returns raw mu-law bytes at 8 kHz -- no conversion needed.
+        Chunks are batched into ~400 ms packets for smooth playback.
+        """
+        mulaw_buffer = b""
+        CHUNK_SIZE = 3200  # ~400ms at 8kHz mulaw
+        chunks_sent = 0
+
+        async for chunk in self._elevenlabs_tts.synthesize_stream(text):
+            mulaw_buffer += chunk
+
+            while len(mulaw_buffer) >= CHUNK_SIZE:
+                send_chunk = mulaw_buffer[:CHUNK_SIZE]
+                mulaw_buffer = mulaw_buffer[CHUNK_SIZE:]
+                chunk_b64 = base64.b64encode(send_chunk).decode("utf-8")
+
+                if self._twilio_ws and self.stream_sid:
+                    await self._twilio_ws.send_json({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": chunk_b64},
+                    })
+                    self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
+                    chunks_sent += 1
+
+        # Flush remaining data
+        if mulaw_buffer and self._twilio_ws and self.stream_sid:
+            chunk_b64 = base64.b64encode(mulaw_buffer).decode("utf-8")
+            await self._twilio_ws.send_json({
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": chunk_b64},
+            })
+            self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
+            chunks_sent += 1
+
+        logger.info(f"ElevenLabs streamed ({chunks_sent} chunks): {text[:50]}")
+
+    # ── OpenAI streaming TTS (fallback) ────────────────────
 
     async def _stream_openai_tts(self, text: str):
-        """Stream OpenAI TTS → PCM 24kHz → resample 8kHz → mulaw → Twilio."""
+        """Stream OpenAI TTS -> PCM 24kHz -> resample 8kHz -> mulaw -> Twilio."""
         try:
             if not self._openai_tts_client:
                 self._openai_tts_client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
@@ -709,7 +802,6 @@ class TwilioRealtimeHandler:
                 input=text,
                 response_format="pcm",
             ) as response:
-                ratecv_state = None
                 pcm_buffer = b""
                 chunks_sent = 0
                 PCM_CHUNK = 4800  # 100ms at 24kHz 16-bit mono
@@ -721,9 +813,7 @@ class TwilioRealtimeHandler:
                         pcm_chunk = pcm_buffer[:PCM_CHUNK]
                         pcm_buffer = pcm_buffer[PCM_CHUNK:]
 
-                        resampled, ratecv_state = audioop.ratecv(
-                            pcm_chunk, 2, 1, 24000, 8000, ratecv_state
-                        )
+                        resampled = downsample_24k_to_8k(pcm_chunk)
                         mulaw = audioop.lin2ulaw(resampled, 2)
                         mulaw_b64 = base64.b64encode(mulaw).decode("utf-8")
                         if self._twilio_ws and self.stream_sid:
@@ -739,45 +829,48 @@ class TwilioRealtimeHandler:
                 if len(pcm_buffer) >= 2:
                     usable = len(pcm_buffer) - (len(pcm_buffer) % 2)
                     if usable > 0:
-                        resampled, ratecv_state = audioop.ratecv(
-                            pcm_buffer[:usable], 2, 1, 24000, 8000, ratecv_state
-                        )
-                        mulaw = audioop.lin2ulaw(resampled, 2)
-                        mulaw_b64 = base64.b64encode(mulaw).decode("utf-8")
-                        if self._twilio_ws and self.stream_sid:
-                            await self._twilio_ws.send_json({
-                                "event": "media",
-                                "streamSid": self.stream_sid,
-                                "media": {"payload": mulaw_b64},
-                            })
-                            self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
-                            chunks_sent += 1
+                        resampled = downsample_24k_to_8k(pcm_buffer[:usable])
+                        if resampled:
+                            mulaw = audioop.lin2ulaw(resampled, 2)
+                            mulaw_b64 = base64.b64encode(mulaw).decode("utf-8")
+                            if self._twilio_ws and self.stream_sid:
+                                await self._twilio_ws.send_json({
+                                    "event": "media",
+                                    "streamSid": self.stream_sid,
+                                    "media": {"payload": mulaw_b64},
+                                })
+                                self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
+                                chunks_sent += 1
 
             logger.info(f"Streamed TTS ({chunks_sent} chunks): {text[:50]}")
 
         except Exception as e:
             logger.error(f"OpenAI TTS streaming failed: {e}", exc_info=True)
 
-    # ── ElevenLabs mulaw delivery ───────────────────────────
+    # ── Flush remaining PCM buffer ──────────────────────────
 
-    async def _send_mulaw_to_twilio(self, mulaw_audio: bytes):
-        """Send mulaw audio to Twilio in ~400ms chunks."""
-        if not self._twilio_ws or not self.stream_sid:
+    async def _flush_pcm_remainder(self):
+        """Flush any remaining PCM data in the buffer (ElevenLabs/pcm16 mode only)."""
+        if not self._pcm_buffer or not self._twilio_ws or not self.stream_sid:
+            self._pcm_buffer = b""
             return
-        CHUNK_SIZE = 3200  # 400ms at 8kHz mulaw
-        for i in range(0, len(mulaw_audio), CHUNK_SIZE):
-            chunk = mulaw_audio[i:i + CHUNK_SIZE]
-            chunk_b64 = base64.b64encode(chunk).decode("utf-8")
-            try:
-                await self._twilio_ws.send_json({
-                    "event": "media",
-                    "streamSid": self.stream_sid,
-                    "media": {"payload": chunk_b64},
-                })
-                self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
-            except Exception as e:
-                logger.error(f"Error sending chunk to Twilio: {e}")
-                break
+        try:
+            usable = len(self._pcm_buffer) - (len(self._pcm_buffer) % 2)
+            if usable > 0:
+                resampled = downsample_24k_to_8k(self._pcm_buffer[:usable])
+                if resampled:
+                    mulaw = audioop.lin2ulaw(resampled, 2)
+                    mulaw_b64 = base64.b64encode(mulaw).decode("utf-8")
+                    await self._twilio_ws.send_json({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": mulaw_b64},
+                    })
+                    self._echo_gate_until = time.monotonic() + self._ECHO_COOLDOWN
+        except Exception as e:
+            logger.error(f"Error flushing PCM remainder: {e}")
+        finally:
+            self._pcm_buffer = b""
 
     # ── Gentle audio stop ─────────────────────────────────
 
@@ -811,7 +904,7 @@ class TwilioRealtimeHandler:
         return False
 
     def _schedule_hangup(self, delay: float):
-        """Schedule a hangup — cancellable if user speaks again."""
+        """Schedule a hangup -- cancellable if user speaks again."""
         self._cancel_hangup()
         self._goodbye_detected = True
         self._hangup_task = asyncio.create_task(self._hangup_after_delay(delay))
@@ -821,7 +914,7 @@ class TwilioRealtimeHandler:
         if self._hangup_task and not self._hangup_task.done():
             self._hangup_task.cancel()
             self._goodbye_detected = False
-            logger.info("Hangup cancelled — user is still speaking")
+            logger.info("Hangup cancelled -- user is still speaking")
 
     async def _hangup_after_delay(self, delay: float):
         """Wait for AI audio to finish, then hang up. Uses thread to avoid blocking event loop."""
@@ -836,13 +929,13 @@ class TwilioRealtimeHandler:
             else:
                 logger.warning("No call_sid available for auto-hangup")
         except asyncio.CancelledError:
-            logger.info("Hangup was cancelled — conversation continues")
+            logger.info("Hangup was cancelled -- conversation continues")
         except Exception as e:
             logger.error(f"Auto-hangup failed: {e}")
 
     @staticmethod
     def _sync_hangup_call(call_sid: str):
-        """Synchronous Twilio hangup — runs in a thread."""
+        """Synchronous Twilio hangup -- runs in a thread."""
         from twilio.rest import Client as TwilioClient
         client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
         client.calls(call_sid).update(status="completed")
