@@ -7,6 +7,6 @@ pydantic==2.10.3
 python-multipart==0.0.20
 numpy==2.2.1
 pydub==0.25.1
-twilio==9.4.0
+# vobiz uses REST API via httpx (already listed below) — no extra SDK needed
 elevenlabs==1.50.0
 httpx==0.28.1

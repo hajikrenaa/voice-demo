@@ -1227,7 +1227,7 @@ function showError(message) {
 }
 
 /**
- * Make an outbound call via Twilio
+ * Make an outbound call via Vobiz
  */
 async function makeOutboundCall() {
     const phoneNumber = phoneInput.value.trim();
@@ -1256,7 +1256,7 @@ async function makeOutboundCall() {
         callStatus.classList.remove('error');
         callStatusText.textContent = `Calling ${dialNumber}...`;
 
-        const response = await authFetch('/twilio/outbound-call', {
+        const response = await authFetch('/vobiz/outbound-call', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ to: dialNumber, elevenlabs: useElevenLabs })
@@ -1265,8 +1265,8 @@ async function makeOutboundCall() {
         const data = await response.json();
 
         if (data.success) {
-            currentCallSid = data.call_sid;
-            callStatusText.textContent = `Connected - Call SID: ${data.call_sid.substring(0, 12)}...`;
+            currentCallSid = data.call_uuid;
+            callStatusText.textContent = `Connected - Call UUID: ${(data.call_uuid || '').substring(0, 12)}...`;
             addMessageToTranscript('assistant', `Calling ${dialNumber}... AI agent is handling the call.`);
         } else {
             throw new Error(data.error || 'Call failed');
@@ -1293,10 +1293,10 @@ async function hangupCall() {
     try {
         callStatusText.textContent = 'Hanging up...';
 
-        const response = await authFetch('/twilio/hangup', {
+        const response = await authFetch('/vobiz/hangup', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ call_sid: currentCallSid })
+            body: JSON.stringify({ call_uuid: currentCallSid })
         });
 
         addMessageToTranscript('assistant', 'Call ended.');

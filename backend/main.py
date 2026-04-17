@@ -21,7 +21,7 @@ from services.llm_service import LLMService
 from services.tts_service import TTSService
 from services.conversation_manager import ConversationManager
 from services.realtime_service import RealtimeService, RealtimeEventHandler
-from services.twilio_stream_service import TwilioRealtimeHandler
+from services.vobiz_stream_service import VobizRealtimeHandler
 from utils.audio_processing import (
     decode_base64_audio,
     encode_audio_to_base64,
@@ -146,7 +146,7 @@ async def health_check():
             "whisper": "configured",
             "gpt4o": "configured",
             "tts": "configured",
-            "twilio": "configured" if Config.TWILIO_ACCOUNT_SID else "not configured",
+            "vobiz": "configured" if Config.VOBIZ_AUTH_ID else "not configured",
             "elevenlabs": "configured" if Config.ELEVENLABS_API_KEY else "not configured",
         },
         "environment": Config.ENVIRONMENT
@@ -246,9 +246,9 @@ _EDITABLE_KEYS = [
     "OPENAI_API_KEY",
     "ELEVENLABS_API_KEY",
     "ELEVENLABS_VOICE_ID",
-    "TWILIO_ACCOUNT_SID",
-    "TWILIO_AUTH_TOKEN",
-    "TWILIO_PHONE_NUMBER",
+    "VOBIZ_AUTH_ID",
+    "VOBIZ_AUTH_TOKEN",
+    "VOBIZ_PHONE_NUMBER",
     "SERVER_URL",
     "LOGIN_USERNAME",
     "LOGIN_PASSWORD",
@@ -320,7 +320,7 @@ async def get_settings(request: Request):
 
     env = _read_env()
     # Build response — mask secret keys, show others in full
-    secret_keys = {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "TWILIO_AUTH_TOKEN", "LOGIN_PASSWORD"}
+    secret_keys = {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "VOBIZ_AUTH_TOKEN", "LOGIN_PASSWORD"}
     settings = {}
     for key in _EDITABLE_KEYS:
         raw = env.get(key, "")
@@ -474,22 +474,22 @@ async def delete_script(script_id: str, request: Request):
 
 
 # ==========================================
-# Twilio Voice Calling Endpoints
+# Vobiz Voice Calling Endpoints
 # ==========================================
 
-# Pre-warmed OpenAI connection — started at TwiML time, consumed by the
-# WebSocket handler ~0.6-1s later so the handshake is already done.
+# Pre-warmed OpenAI connection
 _prewarm_openai_task: asyncio.Task | None = None
+_prewarm_use_elevenlabs: bool = False
 
 
 async def _prewarm_openai_connection(active_script: dict | None = None, use_elevenlabs: bool = False):
     """Open an OpenAI Realtime WebSocket and pre-send session config.
 
-    By sending session.update during the pre-warm (while Twilio is still
+    By sending session.update during the pre-warm (while Vobiz is still
     setting up the media stream), we save ~500ms on the first response.
     """
     model = Config.REALTIME_MODEL
-    url = f"{TwilioRealtimeHandler.OPENAI_REALTIME_URL}?model={model}"
+    url = f"{VobizRealtimeHandler.OPENAI_REALTIME_URL}?model={model}"
     headers = {
         "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
@@ -508,125 +508,142 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
     )
     logger.info("Pre-warmed OpenAI connection ready")
 
-    # Pre-send session config for the default (non-ElevenLabs) case
-    if not use_elevenlabs:
+    try:
+        temp_handler = VobizRealtimeHandler(use_elevenlabs=use_elevenlabs, active_script=active_script)
+        prompt = temp_handler._build_prompt()
+        temperature = 0.6 if active_script else 0.8
+        max_tokens = 400 if active_script else 150
+
+        modalities = ["text"] if use_elevenlabs else ["text", "audio"]
+        output_format = "pcm16" if use_elevenlabs else "g711_ulaw"
+        vad_config = {"type": "semantic_vad", "eagerness": Config.SEMANTIC_VAD_EAGERNESS}
+
+        session_config = {
+            "type": "session.update",
+            "session": {
+                "modalities": modalities,
+                "instructions": prompt,
+                "voice": Config.REALTIME_VOICE,
+                "input_audio_format": "g711_ulaw",
+                "output_audio_format": output_format,
+                "temperature": temperature,
+                "max_response_output_tokens": max_tokens,
+                "input_audio_transcription": {"model": "whisper-1", "language": "en"},
+                "turn_detection": vad_config,
+                "input_audio_noise_reduction": {"type": "near_field"},
+            },
+        }
+        await ws.send(json.dumps(session_config))
+        logger.info(f"Pre-sent session config during pre-warm (elevenlabs={use_elevenlabs})")
+    except Exception as e:
+        logger.warning(f"Failed to pre-send session config: {e} (will cold-connect)")
         try:
-            temp_handler = TwilioRealtimeHandler(active_script=active_script)
-            prompt = temp_handler._build_prompt()
-            temperature = 0.7 if active_script else 0.8
-            max_tokens = 400 if active_script else 150
-
-            # Build VAD config — try semantic_vad first (matches _configure_session logic)
-            vad_config = {"type": "semantic_vad", "eagerness": Config.SEMANTIC_VAD_EAGERNESS}
-
-            session_config = {
-                "type": "session.update",
-                "session": {
-                    "modalities": ["text", "audio"],
-                    "instructions": prompt,
-                    "voice": Config.REALTIME_VOICE,
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "temperature": temperature,
-                    "max_response_output_tokens": max_tokens,
-                    "input_audio_transcription": {"model": "whisper-1", "language": "en"},
-                    "turn_detection": vad_config,
-                    "input_audio_noise_reduction": {"type": "near_field"},
-                },
-            }
-            await ws.send(json.dumps(session_config))
-            # Don't pre-trigger response — let the caller speak first (say hello)
-            # The model will respond after hearing the caller's voice via VAD
-            logger.info("Pre-sent session config during pre-warm (waiting for caller to speak first)")
-        except Exception as e:
-            logger.warning(f"Failed to pre-send session config: {e} (will cold-connect)")
-            # WebSocket is likely dead after the error — discard it
-            try:
-                await ws.close()
-            except Exception:
-                pass
-            return None
+            await ws.close()
+        except Exception:
+            pass
+        return None
 
     return ws
 
-@app.post("/twilio/voice")
-async def twilio_voice_webhook(request: Request):
+
+@app.post("/vobiz/voice")
+async def vobiz_voice_webhook(request: Request):
     """
-    Twilio voice webhook - called when an inbound/outbound call connects.
-    Returns TwiML that tells Twilio to open a bidirectional media stream.
+    Vobiz answer_url webhook — called when an inbound/outbound call connects.
+    Returns Vobiz XML with a <Stream> element to open a bidirectional WebSocket.
     """
     server_url = Config.SERVER_URL
     ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://")
 
-    # Sanitize to prevent TwiML injection — only allow "true" or "false"
-    use_elevenlabs = "true" if request.query_params.get("elevenlabs", "false").lower() == "true" else "false"
+    use_elevenlabs_str = "true" if request.query_params.get("elevenlabs", "false").lower() == "true" else "false"
 
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # extraHeaders passes elevenlabs flag to the WebSocket start event
+    extra_headers = f"elevenlabs={use_elevenlabs_str}"
+
+    vobiz_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Connect>
-        <Stream url="{ws_url}/ws/twilio-stream">
-            <Parameter name="caller" value="{{{{From}}}}" />
-            <Parameter name="elevenlabs" value="{use_elevenlabs}" />
-        </Stream>
-    </Connect>
-    <Say voice="alice">Sorry, the voice agent disconnected. Please try calling again.</Say>
+    <Stream bidirectional="true" keepCallAlive="true"
+            contentType="audio/x-mulaw;rate=8000"
+            statusCallbackUrl="{server_url}/vobiz/stream-status"
+            statusCallbackMethod="POST"
+            extraHeaders="{extra_headers}">
+        {ws_url}/ws/vobiz-stream
+    </Stream>
+    <Speak>Sorry, the voice agent disconnected. Please try calling again.</Speak>
 </Response>"""
 
-    # Start OpenAI handshake + session config now — by the time Twilio opens
-    # the WebSocket (~0.6-1s later), the session will already be configured.
+    # Pre-warm: only start if not already running (outbound-call starts it earlier)
     global _prewarm_openai_task
-    elevenlabs_flag = use_elevenlabs == "true"
-    _prewarm_openai_task = asyncio.create_task(
-        _prewarm_openai_connection(_active_script, elevenlabs_flag)
-    )
+    if not _prewarm_openai_task:
+        elevenlabs_flag = use_elevenlabs_str == "true"
+        _prewarm_openai_task = asyncio.create_task(
+            _prewarm_openai_connection(_active_script, elevenlabs_flag)
+        )
 
-    logger.info(f"Twilio voice webhook called, script_active={_active_script is not None}")
-    logger.info(f"Generated TwiML: {twiml}")
-    return Response(content=twiml, media_type="application/xml")
+    logger.info(f"Vobiz voice webhook called, script_active={_active_script is not None}")
+    return Response(content=vobiz_xml, media_type="application/xml")
 
 
-@app.post("/twilio/outbound-call")
+@app.post("/vobiz/outbound-call")
 async def make_outbound_call(request: Request):
     """
-    API endpoint to initiate an outbound call via Twilio.
-
+    API endpoint to initiate an outbound call via Vobiz REST API.
     Request body: { "to": "+1234567890" }
     """
     if not _require_auth(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
-        from twilio.rest import Client as TwilioClient
+        import httpx
 
         body = await request.json()
         to_number = body.get("to")
         use_elevenlabs = body.get("elevenlabs", False)
 
         if not to_number:
-            return JSONResponse(
-                {"error": "Missing 'to' phone number"}, status_code=400
-            )
+            return JSONResponse({"error": "Missing 'to' phone number"}, status_code=400)
 
-        client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-
-        el = 'true' if use_elevenlabs else 'false'
-        voice_url = f"{Config.SERVER_URL}/twilio/voice?elevenlabs={el}"
-        status_cb = f"{Config.SERVER_URL}/twilio/call-status"
-        call = client.calls.create(
-            to=to_number,
-            from_=Config.TWILIO_PHONE_NUMBER,
-            url=voice_url,
-            status_callback=status_cb,
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
+        # Pre-warm OpenAI connection NOW (while Vobiz dials + phone rings)
+        global _prewarm_openai_task, _prewarm_use_elevenlabs
+        _prewarm_use_elevenlabs = bool(use_elevenlabs)
+        _prewarm_openai_task = asyncio.create_task(
+            _prewarm_openai_connection(_active_script, use_elevenlabs)
         )
 
-        logger.info(f"Outbound call initiated: {call.sid} to {to_number}")
+        el = 'true' if use_elevenlabs else 'false'
+        answer_url = f"{Config.SERVER_URL}/vobiz/voice?elevenlabs={el}"
+        hangup_url = f"{Config.SERVER_URL}/vobiz/call-status"
+
+        payload = {
+            "from": Config.VOBIZ_PHONE_NUMBER,
+            "to": to_number,
+            "answer_url": answer_url,
+            "answer_method": "POST",
+            "hangup_url": hangup_url,
+            "hangup_method": "POST",
+        }
+        api_url = f"https://api.vobiz.ai/api/v1/Account/{Config.VOBIZ_AUTH_ID}/Call/"
+        headers = {
+            "X-Auth-ID": Config.VOBIZ_AUTH_ID,
+            "X-Auth-Token": Config.VOBIZ_AUTH_TOKEN,
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(api_url, json=payload, headers=headers, timeout=15.0)
+
+        if resp.status_code not in (200, 201):
+            logger.error(f"Vobiz outbound call failed: {resp.status_code} {resp.text}")
+            return JSONResponse({"error": resp.text}, status_code=resp.status_code)
+
+        data = resp.json()
+        call_uuid = data.get("request_uuid") or data.get("api_id", "")
+        logger.info(f"Outbound call initiated: {call_uuid} to {to_number}")
 
         return JSONResponse({
             "success": True,
-            "call_sid": call.sid,
+            "call_uuid": call_uuid,
             "to": to_number,
-            "from": Config.TWILIO_PHONE_NUMBER,
-            "status": call.status,
+            "from": Config.VOBIZ_PHONE_NUMBER,
         })
 
     except Exception as e:
@@ -634,52 +651,69 @@ async def make_outbound_call(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.post("/twilio/hangup")
+@app.post("/vobiz/hangup")
 async def hangup_call(request: Request):
-    """Hang up an active Twilio call."""
+    """Hang up an active Vobiz call via REST API."""
     if not _require_auth(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
-        from twilio.rest import Client as TwilioClient
+        import httpx
 
         body = await request.json()
-        call_sid = body.get("call_sid")
+        call_uuid = body.get("call_uuid")
 
-        if not call_sid:
-            return JSONResponse({"error": "Missing call_sid"}, status_code=400)
+        if not call_uuid:
+            return JSONResponse({"error": "Missing call_uuid"}, status_code=400)
 
-        client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-        call = client.calls(call_sid).update(status="completed")
+        url = f"https://api.vobiz.ai/api/v1/Account/{Config.VOBIZ_AUTH_ID}/Call/{call_uuid}/"
+        headers = {
+            "X-Auth-ID": Config.VOBIZ_AUTH_ID,
+            "X-Auth-Token": Config.VOBIZ_AUTH_TOKEN,
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(url, headers=headers, timeout=10.0)
 
-        logger.info(f"Call {call_sid} hung up")
-        return JSONResponse({"success": True, "call_sid": call_sid, "status": call.status})
+        if resp.status_code in (200, 204):
+            logger.info(f"Call {call_uuid} hung up via Vobiz API")
+            return JSONResponse({"success": True, "call_uuid": call_uuid})
+        else:
+            return JSONResponse({"error": resp.text}, status_code=resp.status_code)
 
     except Exception as e:
         logger.error(f"Hangup failed: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.websocket("/ws/twilio-stream")
-async def twilio_media_stream(websocket: WebSocket):
+@app.websocket("/ws/vobiz-stream")
+async def vobiz_media_stream(websocket: WebSocket):
     """
-    WebSocket endpoint for Twilio bidirectional media streams.
+    WebSocket endpoint for Vobiz bidirectional media streams.
     Uses OpenAI Realtime API for ~300-500ms latency.
 
     Audio flows:
-      Twilio (mulaw 8kHz) → PCM16 24kHz → OpenAI Realtime API
-      OpenAI Realtime API → PCM16 24kHz → mulaw 8kHz → Twilio
+      Vobiz (mulaw 8kHz) → g711_ulaw → OpenAI Realtime API
+      OpenAI Realtime API → g711_ulaw → mulaw 8kHz → Vobiz
     """
-    logger.info(f"Incoming WebSocket connection to /ws/twilio-stream. Headers: {dict(websocket.headers)}")
+    logger.info(
+        f"Incoming WebSocket connection to /ws/vobiz-stream. "
+        f"Headers: {dict(websocket.headers)}"
+    )
     await websocket.accept()
-    logger.info("Twilio media stream WebSocket connected and accepted")
+    logger.info("Vobiz media stream WebSocket connected and accepted")
 
     if _active_script:
-        logger.info(f"Creating handler WITH script: {_active_script.get('name', 'unnamed')} ({len(_active_script.get('questions', []))} questions)")
+        logger.info(
+            f"Creating handler WITH script: {_active_script.get('name', 'unnamed')} "
+            f"({len(_active_script.get('questions', []))} questions)"
+        )
     else:
         logger.info("Creating handler WITHOUT script — using default prompt")
-    handler = TwilioRealtimeHandler(active_script=_active_script)
+    handler = VobizRealtimeHandler(
+        use_elevenlabs=_prewarm_use_elevenlabs,
+        active_script=_active_script,
+    )
 
-    # Pass pre-warmed OpenAI connection (with session config already sent) if available
+    # Pass pre-warmed OpenAI connection if available
     global _prewarm_openai_task
     if _prewarm_openai_task:
         handler._prewarm_task = _prewarm_openai_task
@@ -692,60 +726,69 @@ async def twilio_media_stream(websocket: WebSocket):
                 message = json.loads(raw_message)
                 event = message.get("event")
                 if event != "media":
-                    logger.info(f"Twilio stream event: {event}")
-                await handler.handle_twilio_message(websocket, message)
+                    logger.info(f"Vobiz stream event: {event}")
+                await handler.handle_vobiz_message(websocket, message)
             except json.JSONDecodeError:
-                logger.error("Failed to parse Twilio stream message")
+                logger.error("Failed to parse Vobiz stream message")
             except Exception as e:
-                logger.error(f"Error handling Twilio stream message: {e}")
+                logger.error(f"Error handling Vobiz stream message: {e}")
 
     except WebSocketDisconnect:
-        logger.info("Twilio media stream disconnected")
+        logger.info("Vobiz media stream disconnected")
     except Exception as e:
-        logger.error(f"Twilio stream WebSocket error: {e}")
+        logger.error(f"Vobiz stream WebSocket error: {e}")
     finally:
         await handler._full_cleanup()
-        logger.info(f"Twilio stream closed - CallSID: {handler.call_sid}")
+        logger.info(f"Vobiz stream closed — callId: {handler.call_id}")
 
-@app.get("/ws/twilio-stream")
-async def twilio_stream_fallback_get(request: Request):
-    """Temporary endpoint to log what headers we're receiving if WebSocket upgrade fails."""
-    logger.error(f"Received HTTP GET instead of WebSocket on /ws/twilio-stream. Headers: {dict(request.headers)}")
+
+@app.get("/ws/vobiz-stream")
+async def vobiz_stream_fallback_get(request: Request):
+    """Fallback GET — logs if Vobiz sends HTTP instead of WebSocket upgrade."""
+    logger.error(
+        f"Received HTTP GET instead of WebSocket on /ws/vobiz-stream. "
+        f"Headers: {dict(request.headers)}"
+    )
     return {"error": "Expected WebSocket connection"}
 
 
-@app.post("/twilio/call-status")
-async def twilio_call_status(request: Request):
-    """Twilio status callback — logs call lifecycle events for debugging."""
+@app.post("/vobiz/call-status")
+async def vobiz_call_status(request: Request):
+    """Vobiz hangup_url callback — logs call lifecycle events."""
     form = await request.form()
-    call_sid = form.get("CallSid", "?")
-    status = form.get("CallStatus", "?")
-    duration = form.get("CallDuration", "")
-    error_code = form.get("ErrorCode", "")
-    error_msg = form.get("ErrorMessage", "")
+    call_uuid = form.get("CallUUID", form.get("call_uuid", "?"))
+    status = form.get("CallStatus", form.get("Event", "?"))
+    duration = form.get("Duration", "")
 
-    if error_code:
-        logger.error(f"Call {call_sid}: {status} — ERROR {error_code}: {error_msg}")
-    else:
-        extra = f" ({duration}s)" if duration else ""
-        logger.info(f"Call {call_sid}: {status}{extra}")
-
+    extra = f" ({duration}s)" if duration else ""
+    logger.info(f"Vobiz call {call_uuid}: {status}{extra}")
     return Response(status_code=204)
 
 
-@app.get("/twilio/status")
-async def twilio_status():
-    """Check Twilio configuration status."""
-    has_twilio = bool(Config.TWILIO_ACCOUNT_SID and Config.TWILIO_AUTH_TOKEN)
+@app.post("/vobiz/stream-status")
+async def vobiz_stream_status(request: Request):
+    """Vobiz statusCallbackUrl — logs stream lifecycle events."""
+    form = await request.form()
+    event = form.get("Event", "?")
+    stream_id = form.get("StreamID", "?")
+    call_uuid = form.get("CallUUID", "?")
+    logger.info(f"Vobiz stream event: {event} — stream={stream_id}, call={call_uuid}")
+    return Response(status_code=200, content="OK")
+
+
+@app.get("/vobiz/status")
+async def vobiz_status():
+    """Check Vobiz configuration status."""
+    has_vobiz = bool(Config.VOBIZ_AUTH_ID and Config.VOBIZ_AUTH_TOKEN)
     has_elevenlabs = bool(Config.ELEVENLABS_API_KEY)
 
     return JSONResponse({
-        "twilio_configured": has_twilio,
+        "vobiz_configured": has_vobiz,
         "elevenlabs_configured": has_elevenlabs,
-        "twilio_phone": Config.TWILIO_PHONE_NUMBER if has_twilio else None,
+        "vobiz_phone": Config.VOBIZ_PHONE_NUMBER if has_vobiz else None,
         "server_url": Config.SERVER_URL,
-        "webhook_url": f"{Config.SERVER_URL}/twilio/voice",
-        "stream_url": f"{Config.SERVER_URL}/ws/twilio-stream",
+        "answer_url": f"{Config.SERVER_URL}/vobiz/voice",
+        "stream_url": f"{Config.SERVER_URL}/ws/vobiz-stream",
     })
 
 

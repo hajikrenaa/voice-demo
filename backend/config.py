@@ -10,10 +10,10 @@ class Config:
     # OpenAI API Configuration
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-    # Twilio Configuration
-    TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-    TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-    TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+    # Vobiz Configuration
+    VOBIZ_AUTH_ID = os.getenv("VOBIZ_AUTH_ID")
+    VOBIZ_AUTH_TOKEN = os.getenv("VOBIZ_AUTH_TOKEN")
+    VOBIZ_PHONE_NUMBER = os.getenv("VOBIZ_PHONE_NUMBER")
 
     # ElevenLabs Configuration
     ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -24,7 +24,7 @@ class Config:
     LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin")
     LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "admin123")
 
-    # Server URL (public URL for Twilio webhooks)
+    # Server URL (public URL for Vobiz webhooks)
     SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000")
 
     # Environment
@@ -58,13 +58,13 @@ class Config:
     TTS_SPEED = 1.0  # 0.25 to 4.0
 
     # OpenAI Realtime API Configuration (for ultra-low latency)
-    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
+    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
     REALTIME_VOICE = os.getenv("REALTIME_VOICE", "coral")
     REALTIME_AUDIO_FORMAT = "pcm16"  # 24kHz, mono, 16-bit PCM
 
-    # Twilio Audio Settings
-    TWILIO_SAMPLE_RATE = 8000  # Twilio uses 8kHz mulaw
-    TWILIO_AUDIO_FORMAT = "mulaw"  # Twilio media stream format
+    # Vobiz Audio Settings (mulaw 8kHz — zero-conversion)
+    VOBIZ_SAMPLE_RATE = 8000  # Vobiz supports audio/x-mulaw;rate=8000
+    VOBIZ_AUDIO_FORMAT = "audio/x-mulaw"  # Vobiz audio content type
 
     # ── Human-Like Conversation Tuning ──────────────────────
     # Smart interruption handling
@@ -83,13 +83,13 @@ class Config:
     # near_field noise reduction handle echo cancellation
     ECHO_GATE_RMS_HARD = int(os.getenv("ECHO_GATE_RMS_HARD", "600"))
     ECHO_GATE_RMS_SOFT = int(os.getenv("ECHO_GATE_RMS_SOFT", "1000"))
-    ECHO_COOLDOWN_S = float(os.getenv("ECHO_COOLDOWN_S", "0.3"))
+    ECHO_COOLDOWN_S = float(os.getenv("ECHO_COOLDOWN_S", "0.15"))  # was 0.3s
 
-    # VAD tuning for Realtime API
+    # VAD tuning for Realtime API — aggressive settings for minimum latency
     VAD_TYPE = os.getenv("VAD_TYPE", "semantic_vad")
-    VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
-    VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "150"))
-    VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "200"))
+    VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.4"))       # Lower = triggers sooner
+    VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "50"))    # was 150ms
+    VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "100"))  # was 200ms
     SEMANTIC_VAD_EAGERNESS = os.getenv("SEMANTIC_VAD_EAGERNESS", "high")
 
     # System Prompt (structured for mini model — explicit priority rules)
