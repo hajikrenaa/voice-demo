@@ -262,6 +262,12 @@ function setupUIHandlers() {
         });
     }
 
+    // --- Call Mode Tabs (Live / Test) ---
+    setupCallTabs();
+
+    // --- Test Call controls ---
+    setupTestCall();
+
     // --- Agent Config: Questions add/remove ---
     document.getElementById('btnAddQuestion').addEventListener('click', addQuestion);
     document.getElementById('questionsList').addEventListener('click', (e) => {
@@ -1319,6 +1325,118 @@ function resetDialer() {
 }
 
 /**
+ * Call Mode Tabs — Live / Test
+ */
+function setupCallTabs() {
+    const tabLive = document.getElementById('tabLive');
+    const tabTest = document.getElementById('tabTest');
+    const liveCallPanel = document.getElementById('liveCallPanel');
+    const testCallPanel = document.getElementById('testCallPanel');
+
+    if (!tabLive || !tabTest || !liveCallPanel || !testCallPanel) return;
+
+    function activate(which) {
+        const isLive = which === 'live';
+        tabLive.classList.toggle('active', isLive);
+        tabTest.classList.toggle('active', !isLive);
+        liveCallPanel.classList.toggle('hidden', !isLive);
+        testCallPanel.classList.toggle('hidden', isLive);
+    }
+
+    tabLive.addEventListener('click', () => activate('live'));
+    tabTest.addEventListener('click', () => activate('test'));
+}
+
+/**
+ * Test Call controls — in-browser call that reuses the real backend pipeline.
+ */
+let testCallClient = null;
+
+function setupTestCall() {
+    const btnStart = document.getElementById('btnStartTestCall');
+    const btnEnd = document.getElementById('btnEndTestCall');
+    const statusEl = document.getElementById('testCallStatus');
+    const statusText = document.getElementById('testCallStatusText');
+    const transcriptEl = document.getElementById('testCallTranscript');
+    const toggleEl = document.getElementById('testToggleElevenLabs');
+    const voiceHint = document.getElementById('testVoiceHint');
+
+    if (!btnStart || !btnEnd || !statusEl || !statusText || !transcriptEl) return;
+
+    if (toggleEl && voiceHint) {
+        toggleEl.addEventListener('change', () => {
+            voiceHint.textContent = toggleEl.checked
+                ? '(Using ElevenLabs voice)'
+                : '(Using OpenAI built-in voice)';
+        });
+    }
+
+    function setStatus(kind, text) {
+        statusEl.classList.remove('connecting', 'listening', 'speaking', 'ended', 'error');
+        if (kind) statusEl.classList.add(kind);
+        statusText.textContent = text;
+    }
+
+    function clearTranscript() {
+        transcriptEl.innerHTML = '';
+    }
+
+    function appendTranscript(role, text) {
+        if (!text) return;
+        const line = document.createElement('div');
+        line.className = 'transcript-line ' + (role === 'ai' ? 'ai' : 'user');
+        const roleTag = document.createElement('span');
+        roleTag.className = 'role';
+        roleTag.textContent = role === 'ai' ? 'AI' : 'You';
+        line.appendChild(roleTag);
+        line.appendChild(document.createTextNode(text));
+        transcriptEl.appendChild(line);
+        transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function showStartUI() {
+        btnStart.classList.remove('hidden');
+        btnEnd.classList.add('hidden');
+    }
+
+    function showEndUI() {
+        btnStart.classList.add('hidden');
+        btnEnd.classList.remove('hidden');
+    }
+
+    btnStart.addEventListener('click', async () => {
+        if (testCallClient) return;
+        clearTranscript();
+        showEndUI();
+
+        testCallClient = new TestCallClient({
+            elevenlabs: !!(toggleEl && toggleEl.checked),
+            onStatus: (kind, text) => setStatus(kind, text),
+            onTranscript: (role, text) => appendTranscript(role, text),
+            onEnded: () => {
+                showStartUI();
+                testCallClient = null;
+            },
+            onError: (err) => {
+                console.error('Test call error', err);
+                setStatus('error', err.message || 'Error');
+                showError('Test call error: ' + (err.message || err));
+            },
+        });
+
+        await testCallClient.start();
+    });
+
+    btnEnd.addEventListener('click', async () => {
+        if (!testCallClient) {
+            showStartUI();
+            return;
+        }
+        await testCallClient.stop();
+    });
+}
+
+/**
  * Clean up on page unload
  */
 window.addEventListener('beforeunload', () => {
@@ -1330,5 +1448,8 @@ window.addEventListener('beforeunload', () => {
     }
     if (wsClient) {
         wsClient.close();
+    }
+    if (testCallClient) {
+        testCallClient.stop();
     }
 });

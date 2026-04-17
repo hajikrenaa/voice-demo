@@ -45,7 +45,12 @@
       "WebFetch(domain:openai.com)",
       "WebFetch(domain:developers.openai.com)",
       "WebFetch(domain:www.eesel.ai)",
-      "WebFetch(domain:the-rogue-marketing.github.io)"
+      "WebFetch(domain:the-rogue-marketing.github.io)",
+      "Bash(docker compose *)",
+      "Bash(node --check frontend/js/test-call.js)",
+      "Bash(node --check frontend/js/main.js)",
+      "Bash(awk '{print $5}')",
+      "Bash(ENVIRONMENT=production ./venv/Scripts/python.exe main.py)"
     ]
   }
 }

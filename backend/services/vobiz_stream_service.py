@@ -102,6 +102,14 @@ class VobizRealtimeHandler:
         self._ECHO_COOLDOWN = Config.ECHO_COOLDOWN_S
         # Estimated time when Vobiz finishes playing all queued TTS audio
         self._estimated_playback_end = 0.0
+        # First response = the welcome. Must be barge-in-able without echo-gate
+        # filtering or backchannel heuristics, otherwise the caller cannot
+        # interrupt the greeting.
+        self._is_first_response = True
+        # Optional observer hook used by the in-browser test-call bridge to
+        # mirror transcripts to a UI. None in production (Vobiz) path — then
+        # this is a no-op and behavior is identical to before.
+        self._transcript_callback = None  # async (role: str, text: str, final: bool) -> None
 
     # ── Vobiz message handling ──────────────────────────────────────────────
 
@@ -492,6 +500,9 @@ class VobizRealtimeHandler:
     # ── Echo gate ───────────────────────────────────────────────────────────
 
     def _is_echo_gate_active(self) -> bool:
+        # Welcome must be fully interruptible — let all caller audio reach OpenAI
+        if self._is_first_response:
+            return False
         if self._ai_is_responding or self._tts_playing:
             return True
         if time.monotonic() < self._estimated_playback_end + self._ECHO_COOLDOWN:
@@ -655,6 +666,7 @@ class VobizRealtimeHandler:
             transcript = event.get("transcript", "")
             if transcript:
                 logger.info(f"AI said: {transcript[:80]}...")
+                await self._emit_transcript("ai", transcript, True)
                 if self._contains_goodbye(transcript):
                     self._schedule_hangup(3.0)
             self._current_ai_transcript = ""
@@ -672,8 +684,10 @@ class VobizRealtimeHandler:
                 self._response_text_buffer = ""
                 logger.info(f"[flush-final] {text[:60]}")
                 await self._enqueue_tts(text)
-            if full_text and self._contains_goodbye(full_text):
-                self._schedule_hangup(3.0)
+            if full_text:
+                await self._emit_transcript("ai", full_text, True)
+                if self._contains_goodbye(full_text):
+                    self._schedule_hangup(3.0)
             self._current_ai_transcript = ""
 
         elif t == "response.done":
@@ -686,6 +700,10 @@ class VobizRealtimeHandler:
             if self.use_elevenlabs:
                 await self._flush_pcm_remainder()
             self._ai_is_responding = False
+            # Welcome is now over (completed or cancelled) — mid-call behavior from here on
+            if self._is_first_response:
+                self._is_first_response = False
+                logger.info("Welcome done — echo gate + backchannel guard now active")
             if status == "cancelled":
                 self._response_text_buffer = ""
                 saved_transcript = self._current_ai_transcript.strip()
@@ -725,6 +743,7 @@ class VobizRealtimeHandler:
             transcript = event.get("transcript", "")
             if transcript:
                 logger.info(f"User said: \"{transcript}\"")
+                await self._emit_transcript("user", transcript, True)
                 lower = transcript.lower().strip()
                 restart_phrases = ["start over", "start fresh", "restart",
                                    "erase everything", "begin again",
@@ -769,9 +788,23 @@ class VobizRealtimeHandler:
             self._speech_start_time = time.monotonic()
             playback_active = time.monotonic() < self._estimated_playback_end
             if self._ai_is_responding:
-                logger.info("User speech during AI response — clearing Vobiz buffer (pending eval)")
-                self._interrupt_pending = True
-                asyncio.create_task(self._gentle_clear(Config.GENTLE_CLEAR_DELAY_MS / 1000.0))
+                if self._is_first_response:
+                    # Barge-in on the welcome: cancel immediately, skip backchannel heuristic.
+                    logger.info("Caller spoke during welcome — hard interrupt")
+                    self._interrupt_pending = True
+                    self._drain_tts_queue()
+                    self._response_text_buffer = ""
+                    await self._clear_vobiz_audio()
+                    try:
+                        ws = self.openai_ws
+                        if ws:
+                            await ws.send(json.dumps({"type": "response.cancel"}))
+                    except Exception as e:
+                        logger.debug(f"Could not cancel welcome: {e}")
+                else:
+                    logger.info("User speech during AI response — clearing Vobiz buffer (pending eval)")
+                    self._interrupt_pending = True
+                    asyncio.create_task(self._gentle_clear(Config.GENTLE_CLEAR_DELAY_MS / 1000.0))
             elif playback_active:
                 logger.info("Speech detected during TTS playback — likely echo, not interrupting")
 
@@ -806,6 +839,17 @@ class VobizRealtimeHandler:
                 f"OpenAI error: {error.get('message', 'unknown')} "
                 f"(code={error.get('code', '?')})"
             )
+
+    # ── Observer hook (used by test-call bridge only) ───────────────────────
+
+    async def _emit_transcript(self, role: str, text: str, final: bool):
+        cb = self._transcript_callback
+        if cb is None:
+            return
+        try:
+            await cb(role, text, final)
+        except Exception as e:
+            logger.debug(f"Transcript callback failed: {e}")
 
     # ── Interruption helpers ────────────────────────────────────────────────
 
@@ -977,6 +1021,7 @@ class VobizRealtimeHandler:
         self._response_text_buffer = ""
         self._goodbye_detected = False
         self._pcm_buffer = b""
+        self._is_first_response = True
         await self._connect_openai()
 
     # ── Vobiz API: hangup call via REST ────────────────────────────────────

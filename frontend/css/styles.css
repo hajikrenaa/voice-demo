@@ -691,6 +691,185 @@ body {
 }
 
 /* Phone Dialer */
+/* ========= Call Mode Tabs ========= */
+.call-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 0 4px;
+}
+
+.call-tab {
+    background: transparent;
+    border: none;
+    padding: 10px 18px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #64748b;
+    cursor: pointer;
+    border-radius: 10px 10px 0 0;
+    position: relative;
+    top: 1px;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.call-tab:hover {
+    color: #334155;
+}
+
+.call-tab.active {
+    color: #4f46e5;
+    border-bottom-color: #4f46e5;
+    background: #f0f4ff;
+}
+
+.call-tab-hint {
+    margin-left: auto;
+    font-size: 0.8rem;
+    color: #10b981;
+    font-weight: 500;
+}
+
+.tab-panel.hidden {
+    display: none;
+}
+
+/* ========= Test Call Panel ========= */
+.test-call-panel {
+    background: #f0fdf4;
+    border: 2px solid #10b981;
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 20px;
+}
+
+.test-call-header {
+    margin-bottom: 14px;
+}
+
+.test-call-header h2 {
+    font-size: 1.3rem;
+    color: #064e3b;
+    margin-bottom: 4px;
+}
+
+.test-call-subtitle {
+    font-size: 0.85rem;
+    color: #065f46;
+}
+
+.test-call-notice {
+    background: white;
+    border-left: 3px solid #10b981;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: #334155;
+    line-height: 1.45;
+    margin-bottom: 16px;
+}
+
+.test-call-options {
+    margin-bottom: 16px;
+}
+
+.test-call-controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+}
+
+.test-call-controls .btn-large {
+    flex: 1;
+}
+
+.test-call-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: white;
+    border-radius: 10px;
+    margin-bottom: 14px;
+}
+
+.test-call-status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #94a3b8;
+    transition: background 0.2s;
+}
+
+.test-call-status.connecting .test-call-status-dot {
+    background: #f59e0b;
+    animation: pulse 1.5s infinite;
+}
+
+.test-call-status.listening .test-call-status-dot {
+    background: #10b981;
+    animation: pulse 2s infinite;
+}
+
+.test-call-status.speaking .test-call-status-dot {
+    background: #3b82f6;
+    animation: pulse 1s infinite;
+}
+
+.test-call-status.ended .test-call-status-dot {
+    background: #64748b;
+}
+
+.test-call-status.error .test-call-status-dot {
+    background: #ef4444;
+}
+
+.test-call-status-text {
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: #334155;
+}
+
+.test-call-transcript {
+    background: white;
+    border-radius: 10px;
+    padding: 14px;
+    max-height: 260px;
+    overflow-y: auto;
+    min-height: 120px;
+}
+
+.test-call-transcript .transcript-line {
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    border-radius: 8px;
+    font-size: 0.92rem;
+    line-height: 1.4;
+}
+
+.test-call-transcript .transcript-line.ai {
+    background: #eef2ff;
+    color: #3730a3;
+}
+
+.test-call-transcript .transcript-line.user {
+    background: #f1f5f9;
+    color: #0f172a;
+}
+
+.test-call-transcript .transcript-line .role {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.65;
+    margin-right: 6px;
+}
+
 .dialer-panel {
     background: #f0f4ff;
     border: 2px solid #667eea;

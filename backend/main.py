@@ -22,6 +22,7 @@ from services.tts_service import TTSService
 from services.conversation_manager import ConversationManager
 from services.realtime_service import RealtimeService, RealtimeEventHandler
 from services.vobiz_stream_service import VobizRealtimeHandler
+from services.test_call_bridge import run_test_call
 from utils.audio_processing import (
     decode_base64_audio,
     encode_audio_to_base64,
@@ -750,6 +751,53 @@ async def vobiz_stream_fallback_get(request: Request):
         f"Headers: {dict(request.headers)}"
     )
     return {"error": "Expected WebSocket connection"}
+
+
+@app.websocket("/ws/test-call")
+async def test_call_endpoint(websocket: WebSocket):
+    """
+    In-browser test call — uses the EXACT same VobizRealtimeHandler as a real
+    call, bridged to the browser's mic/speakers so no Vobiz credits are used.
+
+    Auth: ?token=<session-token> query param (matches /api/login tokens).
+    """
+    token = websocket.query_params.get("token", "").strip()
+    if not _verify_token(token):
+        await websocket.close(code=4401)
+        logger.warning("Test call WS rejected — invalid or missing token")
+        return
+
+    await websocket.accept()
+    logger.info("Test call WS connected (no Vobiz credits will be used)")
+
+    # Pre-warm OpenAI connection for latency parity with real calls.
+    global _prewarm_openai_task, _prewarm_use_elevenlabs
+    use_elevenlabs = websocket.query_params.get("elevenlabs", "false").lower() == "true"
+    if not _prewarm_openai_task:
+        _prewarm_use_elevenlabs = use_elevenlabs
+        _prewarm_openai_task = asyncio.create_task(
+            _prewarm_openai_connection(_active_script, use_elevenlabs)
+        )
+    prewarm_task = _prewarm_openai_task
+    prewarm_flag = _prewarm_use_elevenlabs
+    _prewarm_openai_task = None
+
+    try:
+        await run_test_call(
+            browser_ws=websocket,
+            active_script=_active_script,
+            prewarm_task=prewarm_task,
+            prewarm_use_elevenlabs=prewarm_flag,
+        )
+    except WebSocketDisconnect:
+        logger.info("Test call WS disconnected")
+    except Exception as e:
+        logger.error(f"Test call WS error: {e}", exc_info=True)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.post("/vobiz/call-status")

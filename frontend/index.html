@@ -140,6 +140,16 @@
                 </div>
             </div>
 
+            <!-- Call Mode Tabs -->
+            <div class="call-tabs" id="callTabs">
+                <button class="call-tab active" data-tab="live" id="tabLive">Live Call</button>
+                <button class="call-tab" data-tab="test" id="tabTest">Test Call</button>
+                <span class="call-tab-hint" id="tabTestHint">· 0 Vobiz credits</span>
+            </div>
+
+            <!-- ========== LIVE CALL TAB ========== -->
+            <div class="tab-panel" id="liveCallPanel">
+
             <!-- Phone Dialer Panel -->
             <div class="dialer-panel" id="dialerPanel">
                 <div class="dialer-header">
@@ -199,6 +209,58 @@
                     </div>
                 </div>
             </div>
+
+            </div>
+            <!-- ========== /LIVE CALL TAB ========== -->
+
+            <!-- ========== TEST CALL TAB ========== -->
+            <div class="tab-panel hidden" id="testCallPanel">
+                <div class="test-call-panel">
+                    <div class="test-call-header">
+                        <h2>Test Call</h2>
+                        <span class="test-call-subtitle">Exact same pipeline as a live call · zero Vobiz credits</span>
+                    </div>
+
+                    <div class="test-call-notice">
+                        Uses the <b>currently activated script</b>, same prompt, same VAD, same interruption and echo handling. The only difference: audio flows through your browser instead of the phone network.
+                    </div>
+
+                    <div class="test-call-options">
+                        <label class="toggle-label" for="testToggleElevenLabs">
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="testToggleElevenLabs" />
+                                <span class="toggle-slider"></span>
+                            </span>
+                            <span class="toggle-text">ElevenLabs Voice</span>
+                            <span class="toggle-hint" id="testVoiceHint">(Using OpenAI built-in voice)</span>
+                        </label>
+                    </div>
+
+                    <div class="test-call-controls">
+                        <button class="btn-primary btn-large" id="btnStartTestCall">
+                            <span class="btn-icon">🎙️</span>
+                            <span class="btn-text">Start Test Call</span>
+                        </button>
+                        <button class="btn-secondary hidden" id="btnEndTestCall">
+                            <span class="btn-icon">⏹️</span>
+                            <span class="btn-text">End Test Call</span>
+                        </button>
+                    </div>
+
+                    <div class="test-call-status" id="testCallStatus">
+                        <div class="test-call-status-dot" id="testCallStatusDot"></div>
+                        <span class="test-call-status-text" id="testCallStatusText">Ready</span>
+                    </div>
+
+                    <div class="test-call-transcript" id="testCallTranscript">
+                        <div class="welcome-message">
+                            <p>Click "Start Test Call" to simulate a call in your browser.</p>
+                            <p class="help-text">The AI will use your active script and behave exactly like it does on a real call.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- ========== /TEST CALL TAB ========== -->
 
             <!-- Summary Panel (hidden by default) -->
             <div class="summary-panel hidden" id="summaryPanel">
@@ -346,6 +408,7 @@
     <script src="/static/js/websocket-client.js?v=9"></script>
     <script src="/static/js/audio-recorder.js?v=9"></script>
     <script src="/static/js/audio-player.js?v=9"></script>
-    <script src="/static/js/main.js?v=11"></script>
+    <script src="/static/js/test-call.js?v=1"></script>
+    <script src="/static/js/main.js?v=12"></script>
 </body>
 </html>

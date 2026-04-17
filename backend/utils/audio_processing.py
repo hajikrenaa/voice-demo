@@ -1,3 +1,4 @@
+import audioop
 import io
 import base64
 
@@ -238,3 +239,16 @@ def downsample_24k_to_8k(pcm_data: bytes) -> bytes:
     filtered = np.convolve(samples, _LP_FILTER, mode="same")
     downsampled = filtered[::3]
     return np.clip(downsampled, -32768, 32767).astype(np.int16).tobytes()
+
+
+def upsample_8k_to_24k(pcm_data: bytes) -> bytes:
+    """Upsample 8 kHz PCM-16 to 24 kHz PCM-16 (for test-call browser playback).
+
+    Uses audioop.ratecv (linear interpolation) which is adequate for
+    phone-band speech. Stateless — the small boundary artefacts at chunk
+    edges are inaudible at ~20 ms chunks.
+    """
+    if not pcm_data:
+        return b""
+    out, _ = audioop.ratecv(pcm_data, 2, 1, 8000, 24000, None)
+    return out
