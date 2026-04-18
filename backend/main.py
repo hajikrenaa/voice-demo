@@ -603,6 +603,19 @@ async def make_outbound_call(request: Request):
         if not to_number:
             return JSONResponse({"error": "Missing 'to' phone number"}, status_code=400)
 
+        missing = [
+            name for name, val in (
+                ("VOBIZ_AUTH_ID", Config.VOBIZ_AUTH_ID),
+                ("VOBIZ_AUTH_TOKEN", Config.VOBIZ_AUTH_TOKEN),
+                ("VOBIZ_PHONE_NUMBER", Config.VOBIZ_PHONE_NUMBER),
+                ("SERVER_URL", Config.SERVER_URL),
+            ) if not val
+        ]
+        if missing:
+            msg = f"Server misconfigured: missing env vars: {', '.join(missing)}"
+            logger.error(msg)
+            return JSONResponse({"error": msg}, status_code=503)
+
         # Pre-warm OpenAI connection NOW (while Vobiz dials + phone rings)
         global _prewarm_openai_task, _prewarm_use_elevenlabs
         _prewarm_use_elevenlabs = bool(use_elevenlabs)
@@ -665,6 +678,11 @@ async def hangup_call(request: Request):
 
         if not call_uuid:
             return JSONResponse({"error": "Missing call_uuid"}, status_code=400)
+
+        if not (Config.VOBIZ_AUTH_ID and Config.VOBIZ_AUTH_TOKEN):
+            msg = "Server misconfigured: missing VOBIZ_AUTH_ID or VOBIZ_AUTH_TOKEN"
+            logger.error(msg)
+            return JSONResponse({"error": msg}, status_code=503)
 
         url = f"https://api.vobiz.ai/api/v1/Account/{Config.VOBIZ_AUTH_ID}/Call/{call_uuid}/"
         headers = {
