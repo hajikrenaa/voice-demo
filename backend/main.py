@@ -38,6 +38,33 @@ _active_sessions: dict[str, float] = {}
 # Scripts storage files
 SCRIPTS_FILE = Path(__file__).parent / "data" / "scripts.json"
 ACTIVE_SCRIPT_FILE = Path(__file__).parent / "data" / "active_script.json"
+RUNTIME_CONFIG_FILE = Path(__file__).parent / "data" / "runtime_config.json"
+
+# Realtime models offered in the UI dropdown
+ALLOWED_REALTIME_MODELS = {
+    "gpt-4o-realtime-preview",
+    "gpt-4o-mini-realtime-preview",
+}
+
+
+def _load_runtime_config():
+    """Apply persisted runtime overrides (e.g. selected realtime model) to Config."""
+    try:
+        if RUNTIME_CONFIG_FILE.exists():
+            data = json.loads(RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
+            model = data.get("realtime_model")
+            if model in ALLOWED_REALTIME_MODELS:
+                Config.REALTIME_MODEL = model
+                print(f"[STARTUP] Realtime model loaded from disk: {model}")
+    except Exception as e:
+        print(f"[STARTUP] Failed to load runtime config: {e}")
+
+
+def _save_runtime_config():
+    """Persist runtime overrides to disk."""
+    RUNTIME_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {"realtime_model": Config.REALTIME_MODEL}
+    RUNTIME_CONFIG_FILE.write_text(json.dumps(data), encoding="utf-8")
 
 
 def _load_active_script() -> dict | None:
@@ -63,6 +90,8 @@ if _active_script:
     print(f"[STARTUP] Active script loaded from disk: {_active_script.get('name', 'unnamed')}")
 else:
     print("[STARTUP] No active script — calls will use default prompt")
+
+_load_runtime_config()
 
 
 def _load_scripts() -> list:
@@ -397,6 +426,39 @@ async def deactivate_script(request: Request):
     _save_active_script(None)
     logger.info("Script deactivated")
     return JSONResponse({"success": True, "active": False})
+
+
+@app.get("/api/realtime-model")
+async def get_realtime_model(request: Request):
+    """Return the currently selected OpenAI Realtime model."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return JSONResponse({
+        "current": Config.REALTIME_MODEL,
+        "available": [
+            {"value": "gpt-4o-realtime-preview", "label": "GPT-4o (Realtime)"},
+            {"value": "gpt-4o-mini-realtime-preview", "label": "GPT-4o mini (Realtime)"},
+        ],
+    })
+
+
+@app.put("/api/realtime-model")
+async def set_realtime_model(request: Request):
+    """Update the OpenAI Realtime model used for all calls (live + test)."""
+    if not _require_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    model = body.get("model", "").strip()
+    if model not in ALLOWED_REALTIME_MODELS:
+        return JSONResponse(
+            {"error": f"Unsupported model. Allowed: {sorted(ALLOWED_REALTIME_MODELS)}"},
+            status_code=400,
+        )
+    Config.REALTIME_MODEL = model
+    os.environ["REALTIME_MODEL"] = model
+    _save_runtime_config()
+    logger.info(f"Realtime model switched to: {model}")
+    return JSONResponse({"success": True, "current": model})
 
 
 @app.get("/api/script/status")

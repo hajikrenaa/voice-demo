@@ -50,7 +50,8 @@
       "Bash(node --check frontend/js/test-call.js)",
       "Bash(node --check frontend/js/main.js)",
       "Bash(awk '{print $5}')",
-      "Bash(ENVIRONMENT=production ./venv/Scripts/python.exe main.py)"
+      "Bash(ENVIRONMENT=production ./venv/Scripts/python.exe main.py)",
+      "PowerShell(Get-CimInstance *)"
     ]
   }
 }

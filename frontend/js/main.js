@@ -304,6 +304,51 @@ function setupUIHandlers() {
     // Load saved scripts and check active status on page load
     loadSavedScripts();
     checkScriptStatus();
+    setupModelSelector();
+}
+
+/**
+ * Realtime model selector — applies to both Live and Test calls.
+ */
+async function setupModelSelector() {
+    const sel = document.getElementById('modelSelect');
+    const hint = document.getElementById('modelSelectorHint');
+    if (!sel) return;
+
+    try {
+        const res = await authFetch('/api/realtime-model');
+        if (res.ok) {
+            const data = await res.json();
+            if (data.current) sel.value = data.current;
+        }
+    } catch (e) {
+        // ignore — fall back to default option
+    }
+
+    sel.addEventListener('change', async () => {
+        const model = sel.value;
+        sel.disabled = true;
+        const prevHint = hint ? hint.textContent : '';
+        if (hint) hint.textContent = 'Saving…';
+        try {
+            const res = await authFetch('/api/realtime-model', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model })
+            });
+            const data = await res.json();
+            if (!data.success) {
+                throw new Error(data.error || 'Failed to update model');
+            }
+            if (hint) hint.textContent = `Saved — ${model}`;
+            setTimeout(() => { if (hint) hint.textContent = prevHint || 'Used by every live + test call'; }, 2500);
+        } catch (e) {
+            showError('Failed to update model: ' + (e.message || e));
+            if (hint) hint.textContent = prevHint || 'Used by every live + test call';
+        } finally {
+            sel.disabled = false;
+        }
+    });
 }
 
 /**

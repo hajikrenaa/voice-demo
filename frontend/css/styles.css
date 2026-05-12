@@ -690,6 +690,49 @@ body {
     border-color: #3b82f6;
 }
 
+/* ========= Model Selector Bar ========= */
+.model-selector-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+}
+
+.model-selector-label {
+    font-weight: 600;
+    color: #0f172a;
+    font-size: 14px;
+}
+
+.model-select {
+    padding: 6px 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #fff;
+    font-size: 14px;
+    color: #0f172a;
+    cursor: pointer;
+}
+
+.model-select:focus {
+    outline: none;
+    border-color: #3b82f6;
+}
+
+.model-select:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.model-selector-hint {
+    color: #64748b;
+    font-size: 12px;
+}
+
 /* Phone Dialer */
 /* ========= Call Mode Tabs ========= */
 .call-tabs {

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Voice Agent</title>
-    <link rel="stylesheet" href="/static/css/styles.css?v=11">
+    <link rel="stylesheet" href="/static/css/styles.css?v=12">
 </head>
 <body>
     <!-- Login Overlay -->
@@ -138,6 +138,16 @@
                 <div class="saved-scripts-list" id="savedScriptsList">
                     <p class="no-scripts-msg" id="noScriptsMsg">No saved scripts yet. Create one above and click Save.</p>
                 </div>
+            </div>
+
+            <!-- Model Selector (applies to both Live and Test calls) -->
+            <div class="model-selector-bar" id="modelSelectorBar">
+                <label for="modelSelect" class="model-selector-label">Model</label>
+                <select id="modelSelect" class="model-select">
+                    <option value="gpt-4o-realtime-preview">GPT-4o (Realtime)</option>
+                    <option value="gpt-4o-mini-realtime-preview">GPT-4o mini (Realtime)</option>
+                </select>
+                <span class="model-selector-hint" id="modelSelectorHint">Used by every live + test call</span>
             </div>
 
             <!-- Call Mode Tabs -->
@@ -409,6 +419,6 @@
     <script src="/static/js/audio-recorder.js?v=9"></script>
     <script src="/static/js/audio-player.js?v=9"></script>
     <script src="/static/js/test-call.js?v=1"></script>
-    <script src="/static/js/main.js?v=12"></script>
+    <script src="/static/js/main.js?v=13"></script>
 </body>
 </html>
