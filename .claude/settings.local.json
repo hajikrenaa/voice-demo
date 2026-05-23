@@ -52,7 +52,10 @@
       "Bash(awk '{print $5}')",
       "Bash(ENVIRONMENT=production ./venv/Scripts/python.exe main.py)",
       "PowerShell(Get-CimInstance *)",
-      "Bash(grep -E \"\\\\.\\(env|gitignore\\)$\")"
+      "Bash(grep -E \"\\\\.\\(env|gitignore\\)$\")",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell($env:PYTHONUNBUFFERED = \"1\"; & \"D:\\\\voice testing for twillow\\\\backend\\\\venv\\\\Scripts\\\\python.exe\" \"D:\\\\voice testing for twillow\\\\backend\\\\main.py\")",
+      "PowerShell($env:PYTHONUNBUFFERED = \"1\"; $env:ENVIRONMENT = \"production\"; & \"D:\\\\voice testing for twillow\\\\backend\\\\venv\\\\Scripts\\\\python.exe\" \"D:\\\\voice testing for twillow\\\\backend\\\\main.py\")"
     ]
   }
 }

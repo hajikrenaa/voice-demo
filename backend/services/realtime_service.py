@@ -34,7 +34,7 @@ class RealtimeService:
             voice: Voice to use (alloy, echo, fable, onyx, nova, shimmer)
         """
         self.api_key = Config.OPENAI_API_KEY
-        self.model = getattr(Config, 'REALTIME_MODEL', 'gpt-realtime-2')
+        self.model = getattr(Config, 'REALTIME_MODEL', 'gpt-4o-realtime-preview')
         self.voice = voice or getattr(Config, 'REALTIME_VOICE', Config.TTS_VOICE)
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.session_id: Optional[str] = None
@@ -83,21 +83,24 @@ class RealtimeService:
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["text", "audio"],
+                "output_modalities": ["audio"],
                 "instructions": Config.SYSTEM_PROMPT,
-                "voice": self.voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                    "language": "en"  # Force English transcription
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {"model": "whisper-1", "language": "en"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.4,
+                            "prefix_padding_ms": 200,
+                            "silence_duration_ms": 300,
+                        },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": self.voice,
+                    },
                 },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.4,  # Lower = more sensitive (was 0.5)
-                    "prefix_padding_ms": 200,  # Reduced from 300ms
-                    "silence_duration_ms": 300  # Reduced from 500ms - faster response!
-                }
             }
         }
         

@@ -42,8 +42,8 @@ RUNTIME_CONFIG_FILE = Path(__file__).parent / "data" / "runtime_config.json"
 
 # Realtime models offered in the UI dropdown
 ALLOWED_REALTIME_MODELS = {
-    "gpt-realtime-2",
-    "gpt-realtime-mini",
+    "gpt-4o-realtime-preview",
+    "gpt-4o-mini-realtime-preview",
 }
 
 
@@ -436,8 +436,8 @@ async def get_realtime_model(request: Request):
     return JSONResponse({
         "current": Config.REALTIME_MODEL,
         "available": [
-            {"value": "gpt-realtime-2", "label": "GPT Realtime 2 (Flagship)"},
-            {"value": "gpt-realtime-mini", "label": "GPT Realtime Mini (Fast & Cheap)"},
+            {"value": "gpt-4o-realtime-preview", "label": "GPT-4o Realtime (Flagship)"},
+            {"value": "gpt-4o-mini-realtime-preview", "label": "GPT-4o Mini Realtime (Fast & Cheap)"},
         ],
     })
 
@@ -573,27 +573,34 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
     try:
         temp_handler = VobizRealtimeHandler(use_elevenlabs=use_elevenlabs, active_script=active_script)
         prompt = temp_handler._build_prompt()
-        temperature = 0.6 if active_script else 0.8
         max_tokens = 400 if active_script else 150
 
-        modalities = ["text"] if use_elevenlabs else ["text", "audio"]
-        output_format = "pcm16" if use_elevenlabs else "g711_ulaw"
+        output_modality = "text" if use_elevenlabs else "audio"
+        output_format_obj = (
+            {"type": "audio/pcm", "rate": 24000} if use_elevenlabs
+            else {"type": "audio/pcmu"}
+        )
         vad_config = {"type": "semantic_vad", "eagerness": Config.SEMANTIC_VAD_EAGERNESS}
 
         session_config = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": modalities,
+                "output_modalities": [output_modality],
                 "instructions": prompt,
-                "voice": Config.REALTIME_VOICE,
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": output_format,
-                "temperature": temperature,
-                "max_response_output_tokens": max_tokens,
-                "input_audio_transcription": {"model": "whisper-1", "language": "en"},
-                "turn_detection": vad_config,
-                "input_audio_noise_reduction": {"type": "near_field"},
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": vad_config,
+                        "transcription": {"model": "whisper-1", "language": "en"},
+                        "noise_reduction": {"type": "near_field"},
+                    },
+                    "output": {
+                        "format": output_format_obj,
+                        "voice": Config.REALTIME_VOICE,
+                    },
+                },
+                "max_output_tokens": max_tokens,
             },
         }
         await ws.send(json.dumps(session_config))

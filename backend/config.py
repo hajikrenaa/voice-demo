@@ -58,7 +58,7 @@ class Config:
     TTS_SPEED = 1.0  # 0.25 to 4.0
 
     # OpenAI Realtime API Configuration (for ultra-low latency)
-    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime-2")
+    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
     REALTIME_VOICE = os.getenv("REALTIME_VOICE", "coral")
     REALTIME_AUDIO_FORMAT = "pcm16"  # 24kHz, mono, 16-bit PCM
 

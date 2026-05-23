@@ -346,10 +346,7 @@ class VobizRealtimeHandler:
                 return True
             logger.warning("Pre-warm session config not confirmed, re-configuring...")
 
-        if self.use_elevenlabs:
-            modalities = ["text"]
-        else:
-            modalities = ["text", "audio"]
+        output_modality = "text" if self.use_elevenlabs else "audio"
 
         prompt = self._build_prompt()
         logger.info(f"System prompt ({len(prompt)} chars): {prompt[:100]}...")
@@ -373,32 +370,34 @@ class VobizRealtimeHandler:
 
         for vad_config in vad_configs:
             vad_type = vad_config["type"]
-            # g711_ulaw matches Vobiz audio/x-mulaw — ZERO conversion needed
-            output_format = "pcm16" if self.use_elevenlabs else "g711_ulaw"
+            output_format_obj = (
+                {"type": "audio/pcm", "rate": 24000} if self.use_elevenlabs
+                else {"type": "audio/pcmu"}
+            )
             session_config = {
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
-                    "modalities": modalities,
+                    "output_modalities": [output_modality],
                     "instructions": prompt,
-                    "voice": Config.REALTIME_VOICE,
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": output_format,
-                    "temperature": temperature,
-                    "max_response_output_tokens": max_tokens,
-                    "input_audio_transcription": {
-                        "model": "whisper-1",
-                        "language": "en",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcmu"},
+                            "turn_detection": vad_config,
+                            "transcription": {"model": "whisper-1", "language": "en"},
+                            "noise_reduction": {"type": "near_field"},
+                        },
+                        "output": {
+                            "format": output_format_obj,
+                            "voice": Config.REALTIME_VOICE,
+                        },
                     },
-                    "turn_detection": vad_config,
-                    "input_audio_noise_reduction": {
-                        "type": "near_field",
-                    },
+                    "max_output_tokens": max_tokens,
                 },
             }
             print(
-                f"[CALL] Sending session config — input=g711_ulaw, output={output_format}, "
-                f"{vad_type}, temp={temperature}",
+                f"[CALL] Sending session config — input=audio/pcmu, "
+                f"output={output_format_obj['type']}, {vad_type}, temp={temperature}",
                 flush=True,
             )
             await self.openai_ws.send(json.dumps(session_config))
@@ -434,9 +433,12 @@ class VobizRealtimeHandler:
                 etype = event.get("type", "")
                 if etype == "session.updated":
                     session = event.get("session", {})
-                    in_fmt = session.get("input_audio_format", "unknown")
-                    out_fmt = session.get("output_audio_format", "unknown")
-                    expected_out = "pcm16" if self.use_elevenlabs else "g711_ulaw"
+                    audio_cfg = session.get("audio", {}) or {}
+                    in_fmt_obj = (audio_cfg.get("input", {}) or {}).get("format", {}) or {}
+                    out_fmt_obj = (audio_cfg.get("output", {}) or {}).get("format", {}) or {}
+                    in_fmt = in_fmt_obj.get("type", "unknown") if isinstance(in_fmt_obj, dict) else "unknown"
+                    out_fmt = out_fmt_obj.get("type", "unknown") if isinstance(out_fmt_obj, dict) else "unknown"
+                    expected_out = "audio/pcm" if self.use_elevenlabs else "audio/pcmu"
                     print(
                         f"[CALL] session.updated -> input={in_fmt}, output={out_fmt} "
                         f"(expected={expected_out})",
@@ -448,14 +450,19 @@ class VobizRealtimeHandler:
                             f"instead of {expected_out} — retrying ***",
                             flush=True,
                         )
-                        expected_modalities = ["text"] if self.use_elevenlabs else ["text", "audio"]
+                        expected_out_obj = (
+                            {"type": "audio/pcm", "rate": 24000} if self.use_elevenlabs
+                            else {"type": "audio/pcmu"}
+                        )
                         await self.openai_ws.send(json.dumps({
                             "type": "session.update",
                             "session": {
                                 "type": "realtime",
-                                "modalities": expected_modalities,
-                                "input_audio_format": "g711_ulaw",
-                                "output_audio_format": expected_out,
+                                "output_modalities": ["text" if self.use_elevenlabs else "audio"],
+                                "audio": {
+                                    "input": {"format": {"type": "audio/pcmu"}},
+                                    "output": {"format": expected_out_obj},
+                                },
                             },
                         }))
                         retry_raw = await asyncio.wait_for(
@@ -463,9 +470,9 @@ class VobizRealtimeHandler:
                         )
                         retry_event = json.loads(retry_raw)
                         if retry_event.get("type") == "session.updated":
-                            retry_fmt = retry_event.get("session", {}).get(
-                                "output_audio_format", "unknown"
-                            )
+                            retry_audio = retry_event.get("session", {}).get("audio", {}) or {}
+                            retry_out = (retry_audio.get("output", {}) or {}).get("format", {}) or {}
+                            retry_fmt = retry_out.get("type", "unknown") if isinstance(retry_out, dict) else "unknown"
                             if retry_fmt == expected_out:
                                 print(f"[CALL] Format corrected to {expected_out} on retry", flush=True)
                             else:
@@ -586,9 +593,21 @@ class VobizRealtimeHandler:
         except Exception as e:
             logger.debug(f"clearAudio failed: {e}")
 
+    # GA Realtime renamed some response.* events. Normalize back to Beta names
+    # so the rest of the handler can stay unchanged.
+    _GA_EVENT_ALIAS = {
+        "response.output_audio.delta": "response.audio.delta",
+        "response.output_audio.done": "response.audio.done",
+        "response.output_audio_transcript.delta": "response.audio_transcript.delta",
+        "response.output_audio_transcript.done": "response.audio_transcript.done",
+        "response.output_text.delta": "response.text.delta",
+        "response.output_text.done": "response.text.done",
+    }
+
     async def _handle_openai_event(self, event: dict):
         """Process an event from OpenAI Realtime API."""
         t = event.get("type", "")
+        t = self._GA_EVENT_ALIAS.get(t, t)
 
         if t == "session.created":
             logger.info("OpenAI session created")
