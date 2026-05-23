@@ -378,6 +378,7 @@ class VobizRealtimeHandler:
             session_config = {
                 "type": "session.update",
                 "session": {
+                    "type": "realtime",
                     "modalities": modalities,
                     "instructions": prompt,
                     "voice": Config.REALTIME_VOICE,
@@ -451,6 +452,7 @@ class VobizRealtimeHandler:
                         await self.openai_ws.send(json.dumps({
                             "type": "session.update",
                             "session": {
+                                "type": "realtime",
                                 "modalities": expected_modalities,
                                 "input_audio_format": "g711_ulaw",
                                 "output_audio_format": expected_out,

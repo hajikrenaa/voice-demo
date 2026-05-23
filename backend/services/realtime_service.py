@@ -82,6 +82,7 @@ class RealtimeService:
         session_config = {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "modalities": ["text", "audio"],
                 "instructions": Config.SYSTEM_PROMPT,
                 "voice": self.voice,

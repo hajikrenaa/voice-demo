@@ -27,6 +27,7 @@ async def test():
         await ws.send(json.dumps({
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "modalities": ["text", "audio"],
                 "voice": "coral",
                 "input_audio_format": "g711_ulaw",
@@ -63,6 +64,7 @@ async def test():
         await ws.send(json.dumps({
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "modalities": ["text", "audio"],
                 "voice": "coral",
                 "input_audio_format": "g711_ulaw",

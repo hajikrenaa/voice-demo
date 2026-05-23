@@ -583,6 +583,7 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
         session_config = {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "modalities": modalities,
                 "instructions": prompt,
                 "voice": Config.REALTIME_VOICE,
