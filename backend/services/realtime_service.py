@@ -34,7 +34,7 @@ class RealtimeService:
             voice: Voice to use (alloy, echo, fable, onyx, nova, shimmer)
         """
         self.api_key = Config.OPENAI_API_KEY
-        self.model = getattr(Config, 'REALTIME_MODEL', 'gpt-4o-realtime-preview')
+        self.model = getattr(Config, 'REALTIME_MODEL', 'gpt-realtime-2')
         self.voice = voice or getattr(Config, 'REALTIME_VOICE', Config.TTS_VOICE)
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.session_id: Optional[str] = None
@@ -53,7 +53,6 @@ class RealtimeService:
             
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
-                "OpenAI-Beta": "realtime=v1"
             }
             
             logger.info(f"Connecting to OpenAI Realtime API: {self.model}")

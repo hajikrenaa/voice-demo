@@ -8,10 +8,9 @@ load_dotenv()
 
 async def test():
     API_KEY = os.getenv("OPENAI_API_KEY")
-    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+    url = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
     headers = {
         "Authorization": f"Bearer {API_KEY}",
-        "OpenAI-Beta": "realtime=v1"
     }
     
     async with websockets.connect(url, additional_headers=headers) as ws:

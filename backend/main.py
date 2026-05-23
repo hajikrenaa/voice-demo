@@ -42,8 +42,8 @@ RUNTIME_CONFIG_FILE = Path(__file__).parent / "data" / "runtime_config.json"
 
 # Realtime models offered in the UI dropdown
 ALLOWED_REALTIME_MODELS = {
-    "gpt-4o-realtime-preview",
-    "gpt-4o-mini-realtime-preview",
+    "gpt-realtime-2",
+    "gpt-realtime-mini",
 }
 
 
@@ -436,8 +436,8 @@ async def get_realtime_model(request: Request):
     return JSONResponse({
         "current": Config.REALTIME_MODEL,
         "available": [
-            {"value": "gpt-4o-realtime-preview", "label": "GPT-4o (Realtime)"},
-            {"value": "gpt-4o-mini-realtime-preview", "label": "GPT-4o mini (Realtime)"},
+            {"value": "gpt-realtime-2", "label": "GPT Realtime 2 (Flagship)"},
+            {"value": "gpt-realtime-mini", "label": "GPT Realtime Mini (Fast & Cheap)"},
         ],
     })
 
@@ -555,7 +555,6 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
     url = f"{VobizRealtimeHandler.OPENAI_REALTIME_URL}?model={model}"
     headers = {
         "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
     }
     logger.info("Pre-warming OpenAI Realtime connection...")
     ws = await asyncio.wait_for(

@@ -190,7 +190,6 @@ class VobizRealtimeHandler:
                 url = f"{self.OPENAI_REALTIME_URL}?model={model}"
                 headers = {
                     "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
-                    "OpenAI-Beta": "realtime=v1",
                 }
                 print(f"[CALL] Connecting to OpenAI Realtime ({model})...", flush=True)
                 self.openai_ws = await asyncio.wait_for(
