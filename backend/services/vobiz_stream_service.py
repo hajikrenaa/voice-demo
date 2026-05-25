@@ -274,7 +274,11 @@ class VobizRealtimeHandler:
 
         parts.append(
             "RULES YOU MUST FOLLOW:\n"
-            "1. Answer the caller's questions first. If they ask 'what is this call about?' — re-explain.\n"
+            "1. ANSWER FIRST, then continue: If the caller asks 'who are you?', 'what is this?', "
+            "'what's this call about?', 'why are you calling?', or seems confused about the call's "
+            "purpose — STOP your script immediately. Briefly re-state: who you are, the position you're "
+            "calling about, and why. Then ask 'Would you like to continue?'. Only after they confirm, "
+            "resume your questions. Do NOT push past confusion — it kills the conversation.\n"
             "2. Only move to the next question AFTER the caller answers the current one. "
             "Questions, complaints, 'I can't hear you' are NOT answers — address them, then re-ask.\n"
             "3. When caller says 'no', 'wrong', 'that's not right', 'that's wrong', or ANY disagreement — STOP. "
@@ -286,9 +290,14 @@ class VobizRealtimeHandler:
             "5. If caller is frustrated — acknowledge, apologize, ask if they want to continue.\n"
             "6. If audio is bad or they ask to repeat — apologize and repeat your last question.\n"
             "7. If caller asks to start over — say 'Sure, let me start fresh' and wait.\n"
-            "8. If caller says they don't want the job, wants to end the call, or says 'bye' — "
-            "politely say 'Thank you for your time. Have a great day! Goodbye.' and stop. "
-            "Do NOT continue with questions or force a recap.\n"
+            "8. ENDING THE CALL — be conservative. Only say 'Thank you for your time. Have a great day! "
+            "Goodbye.' when ONE of these is unambiguously true:\n"
+            "   (a) You have asked ALL questions AND given the full recap AND they confirmed.\n"
+            "   (b) The caller EXPLICITLY says they want to end — e.g. 'I have to go', 'I'm done', "
+            "'let's end this', 'I'm not interested', 'don't call me', 'stop calling'.\n"
+            "   A standalone 'bye', 'bye bye', 'thank you bye', or 'okay bye' while questions are still "
+            "pending is AMBIGUOUS — DO NOT end the call. Instead, politely re-ask your current question: "
+            "'I just need a few more details — [re-ask current question]'. Never say goodbye prematurely.\n"
             "\n"
             "NAMES AND EMAILS — CRITICAL ACCURACY RULES:\n"
             "Phone audio is LOW quality. Single letters sound identical (B/D/P/T, M/N, S/F). "
@@ -296,8 +305,10 @@ class VobizRealtimeHandler:
             "\n"
             "1. NEVER guess or assume a name. NEVER substitute what you heard with a common name. "
             "If it sounds like 'Hajik', say 'Hajik' — do NOT change it to Rajiv, Sajith, or Ranjith.\n"
-            "2. After the caller says their name, ALWAYS ask them to spell using words: "
-            "'Could you spell that using words? For example, A as in Apple, B as in Boy.'\n"
+            "2. After the caller says their name, ask them to spell using words ONLY IF they have "
+            "not already spelled it. If they ALREADY spelled it — either with dashes like 'H-A-J-I-K' "
+            "OR with words like 'H as in Hotel, A as in Apple' — ACCEPT that spelling immediately. "
+            "Do NOT ask them to spell again. Move straight to confirmation: 'Got it, Hajik. Is that correct?'\n"
             "3. When they say words like 'H as in Hotel, A as in Apple, J as in Japan, I as in India, K as in King', "
             "take the FIRST LETTER of each word: H-A-J-I-K → Hajik. Write EXACTLY those letters.\n"
             "4. Do NOT 'correct' the result to a name you recognize. "
@@ -312,6 +323,10 @@ class VobizRealtimeHandler:
             "the email is hajikrenaa@gmail.com. Write EXACTLY those letters. Do NOT rearrange.\n"
             "8. Do NOT end the call until you have collected ALL required information "
             "or the caller explicitly wants to leave.\n"
+            "9. NAME CORRECTIONS / IDENTITY DRIFT: If the caller gives a DIFFERENT name later in the "
+            "call (e.g. earlier 'Haji', later says 'Muhammad'), USE THE LATEST name as the truth. "
+            "Silently discard the previous name — do NOT mix the two, do NOT challenge them with "
+            "'you said X before'. Just accept the new name and re-confirm spelling once.\n"
             "\n"
             "CONVERSATION FLOW:\n"
             "- After a confirmed answer, react briefly, then ask the next question.\n"
@@ -688,7 +703,7 @@ class VobizRealtimeHandler:
                 logger.info(f"AI said: {transcript[:80]}...")
                 await self._emit_transcript("ai", transcript, True)
                 if self._contains_goodbye(transcript):
-                    self._schedule_hangup(3.0)
+                    self._schedule_hangup(4.5)
             self._current_ai_transcript = ""
 
         elif t == "response.text.delta":
@@ -707,7 +722,7 @@ class VobizRealtimeHandler:
             if full_text:
                 await self._emit_transcript("ai", full_text, True)
                 if self._contains_goodbye(full_text):
-                    self._schedule_hangup(3.0)
+                    self._schedule_hangup(4.5)
             self._current_ai_transcript = ""
 
         elif t == "response.done":
@@ -1001,8 +1016,13 @@ class VobizRealtimeHandler:
 
     def _contains_goodbye(self, text: str) -> bool:
         lower = text.lower()
-        goodbye_phrases = ["goodbye", "bye bye", "have a great day", "take care", "farewell"]
-        return any(phrase in lower for phrase in goodbye_phrases)
+        if "goodbye" in lower or "good bye" in lower or "farewell" in lower:
+            return True
+        if "thank you for your time" in lower and (
+            "have a great day" in lower or "take care" in lower
+        ):
+            return True
+        return False
 
     def _schedule_hangup(self, delay_s: float):
         """Schedule a call hangup after delay_s seconds."""
