@@ -30,6 +30,7 @@ import audioop
 import base64
 import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -44,6 +45,66 @@ logger = logging.getLogger(__name__)
 
 # Vobiz REST API base
 VOBIZ_API_BASE = "https://api.vobiz.ai/api/v1"
+
+# NATO phonetic alphabet for forced-confirmation injection.
+NATO_PHONETIC = {
+    'A': 'Alpha', 'B': 'Bravo', 'C': 'Charlie', 'D': 'Delta',
+    'E': 'Echo', 'F': 'Foxtrot', 'G': 'Golf', 'H': 'Hotel',
+    'I': 'India', 'J': 'Juliet', 'K': 'Kilo', 'L': 'Lima',
+    'M': 'Mike', 'N': 'November', 'O': 'Oscar', 'P': 'Papa',
+    'Q': 'Quebec', 'R': 'Romeo', 'S': 'Sierra', 'T': 'Tango',
+    'U': 'Uniform', 'V': 'Victor', 'W': 'Whiskey', 'X': 'X-ray',
+    'Y': 'Yankee', 'Z': 'Zulu',
+}
+
+# Phrases that mean "I want to end the call now without finishing".
+DISENGAGE_PHRASES = (
+    "busy now", "busy right now", "i'm busy", "im busy",
+    "talk to me later", "talk later", "talk to you later",
+    "call me later", "call me back", "call back later",
+    "not a good time", "isn't a good time", "isnt a good time", "bad time",
+    "i have to go", "i gotta go", "gotta go", "got to go", "i need to go",
+    "schedule another time", "schedule later", "schedule it later",
+    "can we do this later", "later please", "another time",
+)
+
+
+def _extract_spelled_letters(transcript: str) -> Optional[str]:
+    """Pull a letter sequence from spelling patterns.
+
+    Handles:
+      - 'A-B-C-D'   (dash pattern) → 'ABCD'
+      - 'A as in Apple, B as in Boy' (phonetic pattern) → 'AB'
+
+    Returns the uppercase letter string (>=3 chars), or None if no clear
+    spelling pattern is present.
+    """
+    dash_matches = re.findall(r'(?:[A-Za-z]-){2,}[A-Za-z]', transcript)
+    if dash_matches:
+        longest = max(dash_matches, key=len)
+        letters = ''.join(c.upper() for c in longest if c.isalpha())
+        if len(letters) >= 3:
+            return letters
+
+    as_in_matches = re.findall(r'\b([A-Za-z])\s+as\s+in\s+[A-Za-z]+', transcript, re.IGNORECASE)
+    if len(as_in_matches) >= 3:
+        return ''.join(c.upper() for c in as_in_matches)
+
+    return None
+
+
+def _build_forced_confirmation(letters: str) -> str:
+    """Return the EXACT sentence the AI must reply with."""
+    pieces = [f"{c} as in {NATO_PHONETIC.get(c, c)}" for c in letters]
+    name = letters[0].upper() + letters[1:].lower()
+    spelled = ", ".join(pieces)
+    return f"Got it: {spelled} — {name}. Is that correct?"
+
+
+def _is_disengage_intent(transcript: str) -> bool:
+    """True if caller's words indicate they want to end the call now."""
+    lower = transcript.lower().strip()
+    return any(phrase in lower for phrase in DISENGAGE_PHRASES)
 
 
 class VobizRealtimeHandler:
@@ -788,9 +849,8 @@ class VobizRealtimeHandler:
                     await self._restart_session()
                     return
 
-                import re
-                has_spelling = bool(re.search(r'[A-Z]-[A-Z]-[A-Z]', transcript))
-                if has_spelling:
+                if _is_disengage_intent(transcript):
+                    logger.info(f"DISENGAGE intent in '{transcript[:60]}' — injecting goodbye")
                     try:
                         ws = self.openai_ws
                         if ws:
@@ -802,15 +862,46 @@ class VobizRealtimeHandler:
                                     "content": [{
                                         "type": "input_text",
                                         "text": (
-                                            f'[Spelled letters detected in caller speech: "{transcript}". '
-                                            f"Assemble these letters exactly for the name/email.]"
+                                            "[The caller wants to end this call now. Your VERY NEXT response "
+                                            "MUST be exactly: \"No problem at all. Thank you for your time. "
+                                            "Have a great day! Goodbye.\" "
+                                            "Do NOT ask any more questions. Do NOT offer to schedule. "
+                                            "Do NOT add anything else. Just say that one sentence and stop.]"
                                         ),
                                     }],
                                 },
                             }))
-                            logger.debug(f"Injected spelling hint: {transcript[:60]}")
                     except Exception as e:
-                        logger.debug(f"Could not inject spelling hint: {e}")
+                        logger.debug(f"Could not inject disengage instruction: {e}")
+
+                letters = _extract_spelled_letters(transcript)
+                if letters:
+                    confirmation = _build_forced_confirmation(letters)
+                    try:
+                        ws = self.openai_ws
+                        if ws:
+                            await ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "system",
+                                    "content": [{
+                                        "type": "input_text",
+                                        "text": (
+                                            f"[The caller just spelled: {letters}. "
+                                            f"Your VERY NEXT response MUST start with EXACTLY this sentence "
+                                            f"(verbatim, word-for-word, letter-for-letter): "
+                                            f"\"{confirmation}\". "
+                                            f"Do NOT substitute any letter. Do NOT reorder letters. "
+                                            f"Do NOT use different phonetic words. "
+                                            f"After that sentence, stop and wait for the caller's confirmation.]"
+                                        ),
+                                    }],
+                                },
+                            }))
+                            logger.info(f"Injected forced confirmation: {letters} -> {confirmation[:60]}")
+                    except Exception as e:
+                        logger.debug(f"Could not inject forced confirmation: {e}")
             else:
                 logger.warning("User audio transcription was EMPTY")
 
