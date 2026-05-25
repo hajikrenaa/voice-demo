@@ -8,7 +8,7 @@ load_dotenv()
 
 async def test():
     API_KEY = os.getenv("OPENAI_API_KEY")
-    url = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
+    url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
     headers = {
         "Authorization": f"Bearer {API_KEY}",
     }

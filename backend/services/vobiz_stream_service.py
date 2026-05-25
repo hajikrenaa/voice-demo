@@ -1019,6 +1019,7 @@ class VobizRealtimeHandler:
 
     async def _delayed_hangup(self, delay_s: float):
         await asyncio.sleep(delay_s)
+        await self.hangup_via_api()
         try:
             if self._vobiz_ws:
                 await self._vobiz_ws.close()

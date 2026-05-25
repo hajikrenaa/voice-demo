@@ -11,6 +11,7 @@ let isConversationActive = false;
 let isAISpeaking = false;  // Track if AI is currently speaking
 let useRealtimeAPI = true;  // Enable Realtime API for ultra-low latency (default: true)
 let authToken = localStorage.getItem('authToken') || null;
+let callStatePollTimer = null;
 
 // UI Elements
 let btnStartStop, btnClear, btnCloseSummary, btnInterrupt;
@@ -1319,6 +1320,7 @@ async function makeOutboundCall() {
             currentCallSid = data.call_uuid;
             callStatusText.textContent = `Connected - Call UUID: ${(data.call_uuid || '').substring(0, 12)}...`;
             addMessageToTranscript('assistant', `Calling ${dialNumber}... AI agent is handling the call.`);
+            startCallStatePolling(data.call_uuid);
         } else {
             throw new Error(data.error || 'Call failed');
         }
@@ -1362,11 +1364,41 @@ async function hangupCall() {
  * Reset dialer UI to idle state
  */
 function resetDialer() {
+    stopCallStatePolling();
     btnCall.disabled = false;
     btnCall.classList.remove('hidden');
     btnHangup.classList.add('hidden');
     callStatus.classList.add('hidden');
     currentCallSid = null;
+}
+
+function startCallStatePolling(callUuid) {
+    stopCallStatePolling();
+    if (!callUuid) return;
+    callStatePollTimer = setInterval(async () => {
+        if (currentCallSid !== callUuid) {
+            stopCallStatePolling();
+            return;
+        }
+        try {
+            const res = await authFetch(`/api/call-state/${encodeURIComponent(callUuid)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data && data.ended) {
+                addMessageToTranscript('assistant', `Call ended (${data.status || 'completed'}).`);
+                resetDialer();
+            }
+        } catch (err) {
+            console.warn('Call-state poll failed:', err);
+        }
+    }, 2500);
+}
+
+function stopCallStatePolling() {
+    if (callStatePollTimer) {
+        clearInterval(callStatePollTimer);
+        callStatePollTimer = null;
+    }
 }
 
 /**

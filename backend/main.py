@@ -35,6 +35,26 @@ _SESSION_TTL = 86400  # 24 hours
 _MAX_SESSIONS = 100
 _active_sessions: dict[str, float] = {}
 
+# Vobiz call state — maps call_uuid -> {status, duration, ts}
+_CALL_STATE_TTL = 3600  # 1 hour
+_call_states: dict[str, dict] = {}
+_TERMINAL_CALL_STATUSES = {
+    "completed", "failed", "busy", "no-answer", "noanswer",
+    "canceled", "cancelled", "hangup", "ended",
+}
+
+
+def _record_call_state(call_uuid: str, status: str, duration: str = ""):
+    """Record/update Vobiz call lifecycle state and prune expired entries."""
+    if not call_uuid:
+        return
+    now = time.time()
+    _call_states[call_uuid] = {"status": status, "duration": duration, "ts": now}
+    # Lightweight prune
+    expired = [k for k, v in _call_states.items() if now - v.get("ts", 0) > _CALL_STATE_TTL]
+    for k in expired:
+        _call_states.pop(k, None)
+
 # Scripts storage files
 SCRIPTS_FILE = Path(__file__).parent / "data" / "scripts.json"
 ACTIVE_SCRIPT_FILE = Path(__file__).parent / "data" / "active_script.json"
@@ -42,8 +62,8 @@ RUNTIME_CONFIG_FILE = Path(__file__).parent / "data" / "runtime_config.json"
 
 # Realtime models offered in the UI dropdown
 ALLOWED_REALTIME_MODELS = {
-    "gpt-4o-realtime-preview",
-    "gpt-4o-mini-realtime-preview",
+    "gpt-realtime",
+    "gpt-realtime-mini",
 }
 
 
@@ -436,8 +456,8 @@ async def get_realtime_model(request: Request):
     return JSONResponse({
         "current": Config.REALTIME_MODEL,
         "available": [
-            {"value": "gpt-4o-realtime-preview", "label": "GPT-4o Realtime (Flagship)"},
-            {"value": "gpt-4o-mini-realtime-preview", "label": "GPT-4o Mini Realtime (Fast & Cheap)"},
+            {"value": "gpt-realtime", "label": "GPT Realtime (Flagship)"},
+            {"value": "gpt-realtime-mini", "label": "GPT Realtime Mini (Fast & Cheap)"},
         ],
     })
 
@@ -721,6 +741,7 @@ async def make_outbound_call(request: Request):
         data = resp.json()
         call_uuid = data.get("request_uuid") or data.get("api_id", "")
         logger.info(f"Outbound call initiated: {call_uuid} to {to_number}")
+        _record_call_state(call_uuid, "initiated")
 
         return JSONResponse({
             "success": True,
@@ -763,6 +784,7 @@ async def hangup_call(request: Request):
 
         if resp.status_code in (200, 204):
             logger.info(f"Call {call_uuid} hung up via Vobiz API")
+            _record_call_state(call_uuid, "completed")
             return JSONResponse({"success": True, "call_uuid": call_uuid})
         else:
             return JSONResponse({"error": resp.text}, status_code=resp.status_code)
@@ -897,7 +919,23 @@ async def vobiz_call_status(request: Request):
 
     extra = f" ({duration}s)" if duration else ""
     logger.info(f"Vobiz call {call_uuid}: {status}{extra}")
+    _record_call_state(call_uuid, str(status).lower(), str(duration))
     return Response(status_code=204)
+
+
+@app.get("/api/call-state/{call_uuid}")
+async def get_call_state(call_uuid: str):
+    """Return latest known Vobiz call state — frontend polls this to detect call end."""
+    state = _call_states.get(call_uuid)
+    if not state:
+        return JSONResponse({"status": "unknown", "ended": False})
+    status_lower = str(state.get("status", "")).lower()
+    ended = status_lower in _TERMINAL_CALL_STATUSES
+    return JSONResponse({
+        "status": status_lower,
+        "duration": state.get("duration", ""),
+        "ended": ended,
+    })
 
 
 @app.post("/vobiz/stream-status")

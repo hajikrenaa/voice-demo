@@ -34,7 +34,7 @@ class RealtimeService:
             voice: Voice to use (alloy, echo, fable, onyx, nova, shimmer)
         """
         self.api_key = Config.OPENAI_API_KEY
-        self.model = getattr(Config, 'REALTIME_MODEL', 'gpt-4o-realtime-preview')
+        self.model = getattr(Config, 'REALTIME_MODEL', 'gpt-realtime')
         self.voice = voice or getattr(Config, 'REALTIME_VOICE', Config.TTS_VOICE)
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.session_id: Optional[str] = None
