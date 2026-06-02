@@ -114,6 +114,32 @@ def _is_disengage_intent(transcript: str) -> bool:
     return any(phrase in lower for phrase in DISENGAGE_PHRASES)
 
 
+def _amplify_ulaw(ulaw_bytes: bytes, target_peak: float, max_gain: float) -> bytes:
+    """Peak-normalize an 8kHz mu-law buffer to make it audibly louder.
+
+    ElevenLabs ulaw_8000 output is quiet over a phone line. We decode to 16-bit
+    linear PCM, scale so the loudest sample reaches `target_peak` of full scale,
+    then re-encode. Gain is capped at `max_gain` (so near-silence isn't blown up)
+    and never applied below 1.0 (so already-loud audio is left untouched). Because
+    the gain is derived from the actual peak, normalization does NOT clip.
+    """
+    if not ulaw_bytes:
+        return ulaw_bytes
+    try:
+        pcm = audioop.ulaw2lin(ulaw_bytes, 2)
+        peak = audioop.max(pcm, 2)  # largest absolute sample value
+        if peak <= 0:
+            return ulaw_bytes
+        gain = (target_peak * 32767.0) / peak
+        gain = min(gain, max_gain)
+        if gain <= 1.0:
+            return ulaw_bytes
+        return audioop.lin2ulaw(audioop.mul(pcm, 2, gain), 2)
+    except Exception as e:
+        logger.debug(f"_amplify_ulaw failed, sending original: {e}")
+        return ulaw_bytes
+
+
 class VobizRealtimeHandler:
     """
     Bridges Vobiz ↔ OpenAI Realtime API.
@@ -1061,6 +1087,9 @@ class VobizRealtimeHandler:
             if self._elevenlabs_tts and self._elevenlabs_available:
                 audio_bytes = await self._elevenlabs_tts.synthesize(text)
                 if audio_bytes:
+                    audio_bytes = _amplify_ulaw(
+                        audio_bytes, Config.TTS_TARGET_PEAK, Config.TTS_MAX_GAIN
+                    )
                     CHUNK_SIZE = 4000
                     for i in range(0, len(audio_bytes), CHUNK_SIZE):
                         chunk = audio_bytes[i:i + CHUNK_SIZE]

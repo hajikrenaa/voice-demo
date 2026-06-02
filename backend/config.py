@@ -19,6 +19,11 @@ class Config:
     ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
     ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
     ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+    # Outbound TTS loudness. ElevenLabs ulaw_8000 output is quiet over the phone;
+    # each utterance is peak-normalized toward TTS_TARGET_PEAK (fraction of full
+    # scale) without clipping, capped at TTS_MAX_GAIN so near-silence isn't blown up.
+    TTS_TARGET_PEAK = float(os.getenv("TTS_TARGET_PEAK", "0.92"))
+    TTS_MAX_GAIN = float(os.getenv("TTS_MAX_GAIN", "4.0"))
 
     # Login Credentials (single user)
     LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin")
