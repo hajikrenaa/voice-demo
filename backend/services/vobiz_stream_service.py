@@ -94,11 +94,18 @@ def _extract_spelled_letters(transcript: str) -> Optional[str]:
 
 
 def _build_forced_confirmation(letters: str) -> str:
-    """Return the EXACT sentence the AI must reply with."""
-    pieces = [f"{c} as in {NATO_PHONETIC.get(c, c)}" for c in letters]
-    name = letters[0].upper() + letters[1:].lower()
-    spelled = ", ".join(pieces)
-    return f"Got it: {spelled} — {name}. Is that correct?"
+    """Return the EXACT sentence the AI must reply with.
+
+    Letters are read back INDIVIDUALLY ("H, A, J, I, K") rather than as full
+    NATO ("H as in Hotel, A as in Alpha, ...").  A full-NATO readback of a
+    10-character name/email runs 15-17s of audio — long enough that the caller
+    can't interrupt to correct an error (barge-in gets suppressed as echo),
+    which turned email confirmation into a ~2-minute loop.  The exact letters
+    are still spoken verbatim, so letter-accuracy protection is preserved; only
+    the delivery is shortened (~5s instead of ~17s).
+    """
+    spelled = ", ".join(letters)
+    return f"Got it, let me confirm the spelling: {spelled}. Is that correct?"
 
 
 def _is_disengage_intent(transcript: str) -> bool:
@@ -776,7 +783,7 @@ class VobizRealtimeHandler:
         elif t == "response.text.delta":
             if self.use_elevenlabs:
                 self._response_text_buffer += event.get("delta", "")
-                self._flush_sentences()
+                await self._flush_sentences()
             self._current_ai_transcript += event.get("delta", "")
 
         elif t == "response.text.done":
@@ -1002,16 +1009,21 @@ class VobizRealtimeHandler:
 
     # ── ElevenLabs TTS pipeline ─────────────────────────────────────────────
 
-    def _flush_sentences(self):
-        """Extract complete sentences from the text buffer and enqueue for TTS."""
-        import re
+    async def _flush_sentences(self):
+        """Extract complete sentences from the text buffer and enqueue for TTS.
+
+        Enqueues are awaited IN ORDER — using asyncio.create_task here would
+        race the direct `await self._enqueue_tts(...)` at response.text.done,
+        interleaving audio chunks so the caller heard sentences out of order
+        (e.g. the next question playing before its lead-in acknowledgement).
+        """
         sentence_end = re.compile(r'(?<=[.!?])\s+')
         parts = sentence_end.split(self._response_text_buffer)
         if len(parts) > 1:
             for sentence in parts[:-1]:
                 sentence = sentence.strip()
                 if sentence:
-                    asyncio.create_task(self._enqueue_tts(sentence))
+                    await self._enqueue_tts(sentence)
             self._response_text_buffer = parts[-1]
 
     async def _enqueue_tts(self, text: str):
