@@ -24,6 +24,12 @@ class Config:
     # scale) without clipping, capped at TTS_MAX_GAIN so near-silence isn't blown up.
     TTS_TARGET_PEAK = float(os.getenv("TTS_TARGET_PEAK", "0.92"))
     TTS_MAX_GAIN = float(os.getenv("TTS_MAX_GAIN", "4.0"))
+    # Hard cap on the length of any single TTS chunk sent to ElevenLabs. A model
+    # runaway (or a remnant with no sentence punctuation) would otherwise be
+    # synthesized as one multi-second, un-interruptible blob. At ulaw_8000,
+    # ~180 chars is roughly ~9s worst case; longer text is split on clause/word
+    # boundaries into separately-queued chunks so barge-in can still drain them.
+    TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "180"))
 
     # Login Credentials (single user)
     LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin")

@@ -140,6 +140,58 @@ def _amplify_ulaw(ulaw_bytes: bytes, target_peak: float, max_gain: float) -> byt
         return ulaw_bytes
 
 
+# Boundaries we prefer to break a long chunk on, best-first: sentence enders,
+# then clause separators. Falls back to whitespace, then a hard slice.
+_TTS_SPLIT_RE = re.compile(r'(?<=[.!?,;:—])\s+|\s+(?=[—])')
+
+
+def _split_for_tts(text: str, max_chars: int) -> list[str]:
+    """Split text into chunks no longer than max_chars for TTS synthesis.
+
+    A single OpenAI runaway (e.g. hitting max_output_tokens with no sentence
+    punctuation) must never become one multi-second, un-interruptible blob.
+    We break on clause boundaries first, then whitespace, then — as a last
+    resort — slice mid-word. Each returned chunk is enqueued separately so an
+    interrupt can drain the rest between chunks.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    def emit():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for unit in _TTS_SPLIT_RE.split(text):
+        if not unit:
+            continue
+        # A single clause longer than the cap: break it on whitespace.
+        if len(unit) > max_chars:
+            emit()
+            for word in unit.split():
+                if current and len(current) + 1 + len(word) > max_chars:
+                    emit()
+                # A single word longer than the cap: hard-slice it.
+                while len(word) > max_chars:
+                    chunks.append(word[:max_chars])
+                    word = word[max_chars:]
+                current = f"{current} {word}".strip() if current else word
+            continue
+        if current and len(current) + 1 + len(unit) > max_chars:
+            emit()
+        current = f"{current} {unit}".strip() if current else unit
+
+    emit()
+    return chunks
+
+
 class VobizRealtimeHandler:
     """
     Bridges Vobiz ↔ OpenAI Realtime API.
@@ -1052,12 +1104,31 @@ class VobizRealtimeHandler:
                     await self._enqueue_tts(sentence)
             self._response_text_buffer = parts[-1]
 
+        # Runaway guard: if the model streams a long span with no sentence-ending
+        # punctuation, the buffer would otherwise grow until response.text.done and
+        # go out as one giant un-interruptible blob (the 28s-chunk bug). Flush it
+        # early once it exceeds the cap, keeping the trailing partial word in the
+        # buffer so we never synthesize a mid-word fragment that is still streaming.
+        if len(self._response_text_buffer) > Config.TTS_MAX_CHARS:
+            buf = self._response_text_buffer
+            cut = buf.rfind(" ")
+            if cut > 0:
+                await self._enqueue_tts(buf[:cut])
+                self._response_text_buffer = buf[cut + 1:]
+
     async def _enqueue_tts(self, text: str):
-        """Enqueue text for TTS processing."""
-        try:
-            await asyncio.wait_for(self._tts_queue.put(text), timeout=2.0)
-        except asyncio.TimeoutError:
-            logger.warning(f"TTS queue full, dropping: {text[:40]}")
+        """Enqueue text for TTS processing.
+
+        Long text is split into bounded chunks (Config.TTS_MAX_CHARS) so a model
+        runaway never becomes one multi-second, un-interruptible synthesis. Each
+        chunk is queued separately, so an interrupt's _drain_tts_queue() can stop
+        the remaining chunks mid-utterance.
+        """
+        for piece in _split_for_tts(text, Config.TTS_MAX_CHARS):
+            try:
+                await asyncio.wait_for(self._tts_queue.put(piece), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"TTS queue full, dropping: {piece[:40]}")
 
     async def _tts_worker(self):
         """Worker that processes TTS queue and sends audio to Vobiz."""
