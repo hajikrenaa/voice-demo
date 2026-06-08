@@ -114,6 +114,32 @@ def _is_disengage_intent(transcript: str) -> bool:
     return any(phrase in lower for phrase in DISENGAGE_PHRASES)
 
 
+# Pure courtesy / closing tokens. An utterance made up ENTIRELY of these words
+# (e.g. "Perfect, all right, thank you", "okay bye", "thanks a lot") is a caller
+# wrapping up — not a new request. Once the agent has ALREADY said goodbye, such a
+# remark should let the pending hangup proceed instead of dragging the agent back
+# into the script. Deliberately conservative: a single substantive word (e.g.
+# "wait", "price", "question") makes _is_closing_remark return False, so a genuine
+# follow-up still keeps the caller on the line.
+_CLOSING_TOKENS = frozenset((
+    "thanks", "thank", "you", "u", "ok", "okay", "kay", "alright", "right",
+    "all", "perfect", "great", "good", "cool", "sure", "yeah", "yep", "yes",
+    "bye", "byebye", "goodbye", "cheers", "fine", "got", "it", "take", "care",
+    "see", "ya", "too", "and", "a", "lot", "much", "appreciate", "that",
+    "have", "day", "nice", "wonderful", "lovely", "for", "your", "time",
+))
+
+
+def _is_closing_remark(transcript: str) -> bool:
+    """True if the WHOLE utterance is just courtesy/closing words. Used only after
+    the agent has already said goodbye, to decide whether the caller is simply
+    signing off (proceed to hang up) or has a real follow-up (stay on the line)."""
+    words = re.findall(r"[a-z]+", transcript.lower())
+    if not words:
+        return False
+    return all(w in _CLOSING_TOKENS for w in words)
+
+
 def _amplify_ulaw(ulaw_bytes: bytes, target_peak: float, max_gain: float) -> bytes:
     """Peak-normalize an 8kHz mu-law buffer to make it audibly louder.
 
@@ -226,6 +252,9 @@ class VobizRealtimeHandler:
         self._script: Optional[dict] = active_script
         self._goodbye_detected = False
         self._hangup_task: Optional[asyncio.Task] = None
+        # True after goodbye while we wait for the caller's last words to decide
+        # whether to proceed with the hangup or cancel it for a real follow-up.
+        self._awaiting_post_goodbye_eval = False
         # Interruption tracking
         self._current_ai_transcript = ""
         self._ai_is_responding = False   # True while OpenAI is generating audio
@@ -444,6 +473,13 @@ class VobizRealtimeHandler:
             "   A standalone 'bye', 'bye bye', 'thank you bye', or 'okay bye' while questions are still "
             "pending is AMBIGUOUS — DO NOT end the call. Instead, politely re-ask your current question: "
             "'I just need a few more details — [re-ask current question]'. Never say goodbye prematurely.\n"
+            "9. \"HELLO?\" IS NOT A RESTART: If the caller just says 'hello?', 'are you there?', or "
+            "'can you hear me?', do NOT replay your whole introduction. Give a brief 'Yes, I can hear "
+            "you — can you hear me okay?' and continue from where you left off.\n"
+            "10. CORRECTIONS WIN: If the caller restates something differently than you just confirmed "
+            "(you said '500 to 1000', they say '500 to 1500'), they are CORRECTING you. Immediately say "
+            "the NEW value back ('Got it, 500 to 1500 — thank you') and use it from then on. Never ignore "
+            "a restated number or keep your old value.\n"
             "\n"
             "NAMES AND EMAILS — CRITICAL ACCURACY RULES:\n"
             "Phone audio is LOW quality. Single letters sound identical (B/D/P/T, M/N, S/F). "
@@ -932,6 +968,32 @@ class VobizRealtimeHandler:
                 logger.info(f"User said: \"{transcript}\"")
                 await self._emit_transcript("user", transcript, True)
                 lower = transcript.lower().strip()
+
+                # ── Post-goodbye decision ────────────────────────────────────
+                # We already said goodbye and paused the pending hangup to hear the
+                # caller out. A pure courtesy closing ("thanks, bye") lets the call
+                # end; anything substantive cancels the hangup so we answer normally.
+                if self._awaiting_post_goodbye_eval:
+                    self._awaiting_post_goodbye_eval = False
+                    if _is_closing_remark(transcript):
+                        logger.info("Post-goodbye closing remark — ending call, not re-engaging")
+                        # Suppress the auto-generated re-engagement (mirror welcome barge-in).
+                        self._drain_tts_queue()
+                        self._response_text_buffer = ""
+                        await self._clear_vobiz_audio()
+                        try:
+                            ws = self.openai_ws
+                            if ws:
+                                await ws.send(json.dumps({"type": "response.cancel"}))
+                        except Exception as e:
+                            logger.debug(f"Could not cancel post-goodbye response: {e}")
+                        if self._hangup_task and not self._hangup_task.done():
+                            self._hangup_task.cancel()
+                        self._goodbye_detected = False
+                        self._schedule_hangup(Config.POST_GOODBYE_HANGUP_DELAY_S)
+                        return
+                    logger.info("Post-goodbye remark is substantive — answering, hangup released")
+                    self._cancel_hangup()
                 restart_phrases = ["start over", "start fresh", "restart",
                                    "erase everything", "begin again",
                                    "start from scratch", "reset"]
@@ -1001,7 +1063,14 @@ class VobizRealtimeHandler:
             logger.error(f"Transcription FAILED: {error.get('message', 'unknown')}")
 
         elif t == "input_audio_buffer.speech_started":
-            self._cancel_hangup()
+            # If we've already said goodbye, don't abandon the hangup outright — pause
+            # it and wait to see whether the caller is just signing off or has a real
+            # follow-up (decided in the transcription handler). Mid-call (no goodbye
+            # pending) this stays exactly as before: a no-op cancel.
+            if self._goodbye_detected:
+                self._pause_hangup()
+            else:
+                self._cancel_hangup()
             self._speech_start_time = time.monotonic()
             playback_active = time.monotonic() < self._estimated_playback_end
             if self._ai_is_responding:
@@ -1246,6 +1315,21 @@ class VobizRealtimeHandler:
             self._goodbye_detected = False
             logger.info("Hangup cancelled (caller spoke again)")
 
+    def _pause_hangup(self):
+        """Caller spoke after we already said goodbye. Cancel the timer so we don't
+        cut them off mid-sentence, but STAY in goodbye mode and flag that we owe a
+        decision once their words are transcribed (see the post-goodbye block in the
+        transcription handler). Arm a generous fallback hangup in case no usable
+        transcript ever arrives, so the call can't hang open. Unlike _cancel_hangup,
+        this keeps _goodbye_detected True."""
+        if self._hangup_task and not self._hangup_task.done():
+            self._hangup_task.cancel()
+        self._awaiting_post_goodbye_eval = True
+        self._hangup_task = asyncio.create_task(
+            self._delayed_hangup(Config.POST_GOODBYE_HANGUP_DELAY_S + 4.0)
+        )
+        logger.info("Hangup paused — evaluating caller's post-goodbye remark")
+
     async def _delayed_hangup(self, delay_s: float):
         await asyncio.sleep(delay_s)
         await self.hangup_via_api()
@@ -1270,6 +1354,7 @@ class VobizRealtimeHandler:
         self._current_ai_transcript = ""
         self._response_text_buffer = ""
         self._goodbye_detected = False
+        self._awaiting_post_goodbye_eval = False
         self._pcm_buffer = b""
         self._is_first_response = True
         await self._connect_openai()

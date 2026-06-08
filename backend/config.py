@@ -83,6 +83,12 @@ class Config:
     BACKCHANNEL_MAX_DURATION_MS = int(os.getenv("BACKCHANNEL_MAX_DURATION_MS", "500"))
     GENTLE_CLEAR_DELAY_MS = int(os.getenv("GENTLE_CLEAR_DELAY_MS", "30"))
 
+    # After the agent says goodbye, how long to wait before hanging up once we've
+    # decided the caller's last words were just a courtesy closing ("thanks, bye").
+    # A substantive follow-up in that window instead cancels the hangup so the agent
+    # can answer. Kept short so the line doesn't sit awkwardly after the sign-off.
+    POST_GOODBYE_HANGUP_DELAY_S = float(os.getenv("POST_GOODBYE_HANGUP_DELAY_S", "1.5"))
+
     # Response pacing
     RESPONSE_PACING_DELAY_MS = int(os.getenv("RESPONSE_PACING_DELAY_MS", "0"))
 
