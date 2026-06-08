@@ -35,6 +35,16 @@ class Config:
     # ~180 chars is roughly ~9s worst case; longer text is split on clause/word
     # boundaries into separately-queued chunks so barge-in can still drain them.
     TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "180"))
+    # Anomaly guard: ElevenLabs flash/turbo intermittently emit 15-22s of garbage
+    # audio for a short phrase (~1 in 3 on some phrases; the extra is active babble,
+    # not trailing silence, so it can't be trimmed). ulaw_8000 = 8000 bytes/s and
+    # normal speech is ~420 bytes/char, so a synthesis longer than
+    # TTS_SANE_FLOOR_BYTES + len(text)*TTS_BYTES_PER_CHAR (≈2.1x normal + a floor) is
+    # the glitch. We re-synthesize up to TTS_ANOMALY_RETRIES times (it's intermittent)
+    # and keep the shortest, hard-capped to the limit if every attempt is bad.
+    TTS_SANE_FLOOR_BYTES = int(os.getenv("TTS_SANE_FLOOR_BYTES", "24000"))
+    TTS_BYTES_PER_CHAR = int(os.getenv("TTS_BYTES_PER_CHAR", "900"))
+    TTS_ANOMALY_RETRIES = int(os.getenv("TTS_ANOMALY_RETRIES", "2"))
 
     # Login Credentials (single user)
     LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin")

@@ -28,7 +28,14 @@ class ElevenLabsTTSService:
         return self._client
 
     async def synthesize(self, text: str) -> bytes:
-        """Convert text to speech using ElevenLabs API."""
+        """Convert text to speech using ElevenLabs API.
+
+        Includes an anomaly guard: flash/turbo intermittently return 15-22s of
+        garbage audio for a short phrase (active babble, not trailing silence, so it
+        can't be trimmed). If a synthesis is far longer than the text warrants, we
+        re-synthesize (the glitch is non-deterministic) and keep the shortest result,
+        hard-capping it if every attempt is bad. Tunable via Config.TTS_* knobs.
+        """
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
@@ -51,16 +58,45 @@ class ElevenLabsTTSService:
             },
         }
 
+        # ulaw_8000 is 8000 bytes/s and normal speech is ~420 bytes/char; anything
+        # past this limit is the intermittent flash/turbo runaway glitch.
+        max_ok = Config.TTS_SANE_FLOOR_BYTES + len(text) * Config.TTS_BYTES_PER_CHAR
+        attempts = Config.TTS_ANOMALY_RETRIES + 1
+        best = None
+
         try:
             client = self._get_client()
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
+            for attempt in range(attempts):
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                audio_bytes = response.content
 
-            audio_bytes = response.content
-            logger.info(
-                f"ElevenLabs TTS: synthesized {len(audio_bytes)} bytes for: {text[:50]}..."
+                if best is None or len(audio_bytes) < len(best):
+                    best = audio_bytes
+
+                if len(audio_bytes) <= max_ok:
+                    if attempt > 0:
+                        logger.info(
+                            f"ElevenLabs TTS: clean on retry {attempt} "
+                            f"({len(audio_bytes)}b) for: {text[:40]}"
+                        )
+                    logger.info(
+                        f"ElevenLabs TTS: synthesized {len(audio_bytes)} bytes for: {text[:50]}..."
+                    )
+                    return audio_bytes
+
+                logger.warning(
+                    f"ElevenLabs TTS anomaly: {len(audio_bytes)}b > {max_ok}b cap "
+                    f"for {len(text)}-char text (attempt {attempt + 1}/{attempts}): {text[:40]}"
+                )
+
+            # Every attempt was anomalous — cap the damage to the shortest, truncated.
+            capped = best[:max_ok]
+            logger.error(
+                f"ElevenLabs TTS still anomalous after {attempts} attempts; "
+                f"capped {len(best)}b -> {len(capped)}b for: {text[:40]}"
             )
-            return audio_bytes
+            return capped
 
         except httpx.HTTPStatusError as e:
             logger.error(f"ElevenLabs API error: {e.response.status_code}")
