@@ -22,8 +22,13 @@ class Config:
     # Outbound TTS loudness. ElevenLabs ulaw_8000 output is quiet over the phone;
     # each utterance is peak-normalized toward TTS_TARGET_PEAK (fraction of full
     # scale) without clipping, capped at TTS_MAX_GAIN so near-silence isn't blown up.
-    TTS_TARGET_PEAK = float(os.getenv("TTS_TARGET_PEAK", "0.92"))
-    TTS_MAX_GAIN = float(os.getenv("TTS_MAX_GAIN", "4.0"))
+    # Softened 2026-06-08 (peak 0.92->0.85, gain 4.0->2.5): a live call showed the
+    # voice was harsh/crackly. The old 4x cap amplified mu-law companding noise on
+    # quiet utterances into audible crackle; the 0.92 target also ran uncomfortably
+    # hot for an 8kHz phone line. Still boosts (up to 2.5x toward 0.85 peak) so it
+    # stays louder than raw ElevenLabs ulaw, just cleaner. Both env-overridable.
+    TTS_TARGET_PEAK = float(os.getenv("TTS_TARGET_PEAK", "0.85"))
+    TTS_MAX_GAIN = float(os.getenv("TTS_MAX_GAIN", "2.5"))
     # Hard cap on the length of any single TTS chunk sent to ElevenLabs. A model
     # runaway (or a remnant with no sentence punctuation) would otherwise be
     # synthesized as one multi-second, un-interruptible blob. At ulaw_8000,
