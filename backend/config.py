@@ -19,6 +19,14 @@ class Config:
     ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
     ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
     ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+    # ElevenLabs voice_settings — control delivery stability/tone. Raised stability
+    # 0.5->0.7 on 2026-06-11: a live call sounded over-emotional / uneven. Higher
+    # stability = steadier, more even delivery (too high trends robotic); style=0.0
+    # keeps it non-exaggerated. All env-overridable so the tone can be dialed live.
+    TTS_STABILITY = float(os.getenv("TTS_STABILITY", "0.7"))
+    TTS_SIMILARITY_BOOST = float(os.getenv("TTS_SIMILARITY_BOOST", "0.75"))
+    TTS_STYLE = float(os.getenv("TTS_STYLE", "0.0"))
+    TTS_USE_SPEAKER_BOOST = os.getenv("TTS_USE_SPEAKER_BOOST", "true").lower() == "true"
     # Outbound TTS loudness. ElevenLabs ulaw_8000 output is quiet over the phone;
     # each utterance is peak-normalized toward TTS_TARGET_PEAK (fraction of full
     # scale) without clipping, capped at TTS_MAX_GAIN so near-silence isn't blown up.

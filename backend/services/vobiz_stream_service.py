@@ -533,8 +533,11 @@ class VobizRealtimeHandler:
 
         Returns True if session config was confirmed, False on failure.
         """
-        # Fast path: session was already configured during pre-warm
-        if self._session_preconfigured and not self.use_elevenlabs:
+        # Fast path: session was already configured during pre-warm. The pre-warm
+        # (main.py) sends the full session.update for BOTH modes — including the
+        # ElevenLabs text/audio-pcm output format — so we can skip the redundant
+        # re-config + up-to-5s re-wait and just confirm the buffered session.updated.
+        if self._session_preconfigured:
             logger.info("Session pre-configured during pre-warm, waiting for confirmation...")
             temperature = 0.6 if self._script else 0.8
             max_tokens = 400 if self._script else 150

@@ -27,6 +27,18 @@ class ElevenLabsTTSService:
             self._client = httpx.AsyncClient(timeout=30.0)
         return self._client
 
+    def _voice_settings(self) -> dict:
+        """Voice delivery settings (env-tunable via Config.TTS_*).
+
+        Higher stability = steadier, more even tone; style=0.0 = non-exaggerated.
+        """
+        return {
+            "stability": Config.TTS_STABILITY,
+            "similarity_boost": Config.TTS_SIMILARITY_BOOST,
+            "style": Config.TTS_STYLE,
+            "use_speaker_boost": Config.TTS_USE_SPEAKER_BOOST,
+        }
+
     async def synthesize(self, text: str) -> bytes:
         """Convert text to speech using ElevenLabs API.
 
@@ -50,12 +62,7 @@ class ElevenLabsTTSService:
         payload = {
             "text": text,
             "model_id": self.model_id,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-                "style": 0.0,
-                "use_speaker_boost": True,
-            },
+            "voice_settings": self._voice_settings(),
         }
 
         # ulaw_8000 is 8000 bytes/s and normal speech is ~420 bytes/char; anything
@@ -121,10 +128,7 @@ class ElevenLabsTTSService:
         payload = {
             "text": text,
             "model_id": self.model_id,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-            },
+            "voice_settings": self._voice_settings(),
         }
 
         try:
