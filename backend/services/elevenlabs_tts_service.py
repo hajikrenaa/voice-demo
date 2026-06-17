@@ -15,10 +15,21 @@ class ElevenLabsTTSService:
 
     API_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 
-    def __init__(self, voice_id: str = None):
+    def __init__(self, voice_id: str = None, language: str = "en"):
         self.api_key = Config.ELEVENLABS_API_KEY
-        self.voice_id = voice_id or Config.ELEVENLABS_VOICE_ID
+        self.language = language
+        # Pick the language-appropriate voice unless an explicit voice_id is given.
+        # Tamil uses a native Tamil voice; English keeps the existing default (Rachel).
+        if voice_id:
+            self.voice_id = voice_id
+        elif language == "ta":
+            self.voice_id = Config.ELEVENLABS_VOICE_ID_TA
+        else:
+            self.voice_id = Config.ELEVENLABS_VOICE_ID
         self.model_id = Config.ELEVENLABS_MODEL_ID
+        # flash/turbo v2.5 support `language_code` to ENFORCE the output language; only
+        # sent for Tamil so English requests are byte-for-byte unchanged (auto-detect).
+        self.language_code = "ta" if language == "ta" else None
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -64,10 +75,17 @@ class ElevenLabsTTSService:
             "model_id": self.model_id,
             "voice_settings": self._voice_settings(),
         }
+        if self.language_code:
+            payload["language_code"] = self.language_code
 
         # ulaw_8000 is 8000 bytes/s and normal speech is ~420 bytes/char; anything
-        # past this limit is the intermittent flash/turbo runaway glitch.
-        max_ok = Config.TTS_SANE_FLOOR_BYTES + len(text) * Config.TTS_BYTES_PER_CHAR
+        # past this limit is the intermittent flash/turbo runaway glitch. Tamil is
+        # denser per character, so it uses a larger per-char allowance.
+        bytes_per_char = (
+            Config.TTS_BYTES_PER_CHAR_TA if self.language == "ta"
+            else Config.TTS_BYTES_PER_CHAR
+        )
+        max_ok = Config.TTS_SANE_FLOOR_BYTES + len(text) * bytes_per_char
         attempts = Config.TTS_ANOMALY_RETRIES + 1
         best = None
 
@@ -130,6 +148,8 @@ class ElevenLabsTTSService:
             "model_id": self.model_id,
             "voice_settings": self._voice_settings(),
         }
+        if self.language_code:
+            payload["language_code"] = self.language_code
 
         try:
             client = self._get_client()

@@ -12,6 +12,34 @@ A professional web-based AI voice agent with human-like speech, >90% accuracy, a
 - **Conversation Summary**: Automatic summary generation at conversation end
 - **Beautiful UI**: Modern, responsive web interface
 - **Multiple Voices**: Choose from 6 different AI voices
+- **Tamil Language Calls (add-on)**: Per-call English/Tamil selection (see below)
+
+## Tamil Language Calls (add-on)
+
+Phone calls (live Vobiz calls **and** in-browser Test Calls) can run in **Tamil** as well
+as English. It's a **per-call** choice — pick it from the **Language** dropdown in the
+selector bar before starting a call. English calls are completely unchanged.
+
+How it works:
+- **Both voice engines work in Tamil**, selected per call with the existing ElevenLabs toggle:
+  - *OpenAI native* (toggle off): lowest latency speech-to-speech in Tamil.
+  - *ElevenLabs* (toggle on): a native Tamil voice (default **Meera**) — best pronunciation.
+- The agent speaks **natural colloquial Tamil with Tanglish** (keeps English numbers/brand
+  terms), uses the Indian number system, and confirms English names/emails with English
+  letters ("at the rate", "dot") — tuned for real Tamil phone callers.
+- Input transcription is forced to Tamil (`language: "ta"`).
+
+Configuration (all optional — sensible defaults are baked in; see `.env.example`):
+- `ELEVENLABS_VOICE_ID_TA` — Tamil ElevenLabs voice (default Meera). Add it to your
+  ElevenLabs workspace, or set your own Tamil voice ID.
+- `REALTIME_VOICE_TA` — OpenAI native Tamil voice (default = the English voice; try
+  `marin`/`cedar`).
+- `TRANSCRIPTION_MODEL_TA` — defaults to `whisper-1` (guaranteed compatible). For better
+  Tamil accuracy, set `gpt-4o-transcribe` after a test call confirms it connects.
+
+Known v1 limitation: the English "I'm busy / call me later" early-exit phrase list is not
+yet translated, so that specific shortcut won't trigger on Tamil phrasing — the normal
+conversation and goodbye flow still work.
 
 ## Tech Stack
 

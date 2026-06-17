@@ -148,6 +148,13 @@
                     <option value="gpt-realtime-mini">GPT Realtime Mini (Fast & Cheap)</option>
                 </select>
                 <span class="model-selector-hint" id="modelSelectorHint">Used by every live + test call</span>
+
+                <label for="langSelect" class="model-selector-label">Language</label>
+                <select id="langSelect" class="model-select">
+                    <option value="en" selected>English</option>
+                    <option value="ta">தமிழ் (Tamil)</option>
+                </select>
+                <span class="model-selector-hint" id="langSelectorHint">Chosen per call (live + test)</span>
             </div>
 
             <!-- Call Mode Tabs -->
@@ -337,8 +344,12 @@
                             </div>
                         </div>
                         <div class="api-setting-item">
-                            <label for="settingElevenLabsVoice">Voice ID</label>
-                            <input type="text" id="settingElevenLabsVoice" data-key="ELEVENLABS_VOICE_ID" placeholder="Voice ID" class="api-key-input" />
+                            <label for="settingElevenLabsVoice">Voice ID (English)</label>
+                            <input type="text" id="settingElevenLabsVoice" data-key="ELEVENLABS_VOICE_ID" placeholder="English voice ID" class="api-key-input" />
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingElevenLabsVoiceTa">Voice ID (Tamil)</label>
+                            <input type="text" id="settingElevenLabsVoiceTa" data-key="ELEVENLABS_VOICE_ID_TA" placeholder="Tamil voice ID (e.g. Meera)" class="api-key-input" />
                         </div>
                     </div>
 
@@ -418,7 +429,7 @@
     <script src="/static/js/websocket-client.js?v=9"></script>
     <script src="/static/js/audio-recorder.js?v=9"></script>
     <script src="/static/js/audio-player.js?v=9"></script>
-    <script src="/static/js/test-call.js?v=1"></script>
-    <script src="/static/js/main.js?v=14"></script>
+    <script src="/static/js/test-call.js?v=2"></script>
+    <script src="/static/js/main.js?v=15"></script>
 </body>
 </html>

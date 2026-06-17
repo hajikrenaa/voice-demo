@@ -1279,6 +1279,14 @@ function showError(message) {
 }
 
 /**
+ * Read the per-call language selection ("en" | "ta"). Applies to live + test calls.
+ */
+function getSelectedLanguage() {
+    const el = document.getElementById('langSelect');
+    return el ? el.value : 'en';
+}
+
+/**
  * Make an outbound call via Vobiz
  */
 async function makeOutboundCall() {
@@ -1299,6 +1307,7 @@ async function makeOutboundCall() {
 
     const dialNumber = cleaned.startsWith('+') ? cleaned : '+' + cleaned;
     const useElevenLabs = document.getElementById('toggleElevenLabs')?.checked || false;
+    const language = getSelectedLanguage();
 
     try {
         btnCall.disabled = true;
@@ -1311,7 +1320,7 @@ async function makeOutboundCall() {
         const response = await authFetch('/vobiz/outbound-call', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to: dialNumber, elevenlabs: useElevenLabs })
+            body: JSON.stringify({ to: dialNumber, elevenlabs: useElevenLabs, language })
         });
 
         const data = await response.json();
@@ -1488,6 +1497,7 @@ function setupTestCall() {
 
         testCallClient = new TestCallClient({
             elevenlabs: !!(toggleEl && toggleEl.checked),
+            language: getSelectedLanguage(),
             onStatus: (kind, text) => setStatus(kind, text),
             onTranscript: (role, text) => appendTranscript(role, text),
             onEnded: () => {

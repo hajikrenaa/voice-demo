@@ -17,6 +17,7 @@ class TestCallClient {
         this.player = null;
         this.isActive = false;
         this.useElevenLabs = !!options.elevenlabs;
+        this.language = options.language === 'ta' ? 'ta' : 'en';
 
         // UI callbacks
         this.onStatus = options.onStatus || (() => {});
@@ -65,7 +66,8 @@ class TestCallClient {
         const el = this.useElevenLabs ? 'true' : 'false';
         const url = `${proto}//${location.host}/ws/test-call`
             + `?token=${encodeURIComponent(token)}`
-            + `&elevenlabs=${el}`;
+            + `&elevenlabs=${el}`
+            + `&language=${encodeURIComponent(this.language)}`;
 
         this.onStatus('connecting', 'Connecting…');
 
@@ -82,6 +84,7 @@ class TestCallClient {
             this.ws.send(JSON.stringify({
                 type: 'start',
                 elevenlabs: this.useElevenLabs,
+                language: this.language,
             }));
             this.isActive = true;
             try {

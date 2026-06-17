@@ -129,6 +129,15 @@ def _save_scripts(scripts: list):
     SCRIPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SCRIPTS_FILE.write_text(json.dumps(scripts, indent=2), encoding="utf-8")
 
+# Windows consoles default to cp1252, which can't encode Tamil (or other non-Latin)
+# text — logging a Tamil transcript raised UnicodeEncodeError and spammed tracebacks.
+# Force UTF-8 on stdout/stderr so multi-language transcripts log cleanly.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", line_buffering=True)
+    except Exception:
+        pass
+
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
@@ -296,6 +305,7 @@ _EDITABLE_KEYS = [
     "OPENAI_API_KEY",
     "ELEVENLABS_API_KEY",
     "ELEVENLABS_VOICE_ID",
+    "ELEVENLABS_VOICE_ID_TA",
     "VOBIZ_AUTH_ID",
     "VOBIZ_AUTH_TOKEN",
     "VOBIZ_PHONE_NUMBER",
@@ -563,9 +573,14 @@ async def delete_script(script_id: str, request: Request):
 # Pre-warmed OpenAI connection
 _prewarm_openai_task: asyncio.Task | None = None
 _prewarm_use_elevenlabs: bool = False
+# Language ("en" | "ta") the pre-warm + handler should use for the next call. Set right
+# before pre-warming (outbound-call / test-call / inbound voice webhook) so the
+# pre-warmed session carries the correct transcription language, voice and prompt.
+_prewarm_language: str = "en"
 
 
-async def _prewarm_openai_connection(active_script: dict | None = None, use_elevenlabs: bool = False):
+async def _prewarm_openai_connection(active_script: dict | None = None, use_elevenlabs: bool = False,
+                                     language: str = "en"):
     """Open an OpenAI Realtime WebSocket and pre-send session config.
 
     By sending session.update during the pre-warm (while Vobiz is still
@@ -591,7 +606,9 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
     logger.info("Pre-warmed OpenAI connection ready")
 
     try:
-        temp_handler = VobizRealtimeHandler(use_elevenlabs=use_elevenlabs, active_script=active_script)
+        temp_handler = VobizRealtimeHandler(
+            use_elevenlabs=use_elevenlabs, active_script=active_script, language=language
+        )
         prompt = temp_handler._build_prompt()
         max_tokens = 400 if active_script else 150
 
@@ -612,19 +629,22 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": vad_config,
-                        "transcription": {"model": "whisper-1", "language": "en"},
+                        "transcription": temp_handler._transcription_config(),
                         "noise_reduction": {"type": "near_field"},
                     },
                     "output": {
                         "format": output_format_obj,
-                        "voice": Config.REALTIME_VOICE,
+                        "voice": temp_handler._realtime_voice(),
                     },
                 },
                 "max_output_tokens": max_tokens,
             },
         }
         await ws.send(json.dumps(session_config))
-        logger.info(f"Pre-sent session config during pre-warm (elevenlabs={use_elevenlabs})")
+        logger.info(
+            f"Pre-sent session config during pre-warm (elevenlabs={use_elevenlabs}, "
+            f"language={language}, transcribe={temp_handler._transcription_config()['model']})"
+        )
     except Exception as e:
         logger.warning(f"Failed to pre-send session config: {e} (will cold-connect)")
         try:
@@ -647,8 +667,12 @@ async def vobiz_voice_webhook(request: Request):
 
     use_elevenlabs_str = "true" if request.query_params.get("elevenlabs", "false").lower() == "true" else "false"
 
-    # extraHeaders passes elevenlabs flag to the WebSocket start event
-    extra_headers = f"elevenlabs={use_elevenlabs_str}"
+    lang = request.query_params.get("lang", "en").lower()
+    if lang not in Config.SUPPORTED_LANGUAGES:
+        lang = "en"
+
+    # extraHeaders passes the elevenlabs flag + language to the WebSocket start event
+    extra_headers = f"elevenlabs={use_elevenlabs_str},language={lang}"
 
     vobiz_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -662,12 +686,14 @@ async def vobiz_voice_webhook(request: Request):
     <Speak>Sorry, the voice agent disconnected. Please try calling again.</Speak>
 </Response>"""
 
-    # Pre-warm: only start if not already running (outbound-call starts it earlier)
-    global _prewarm_openai_task
+    # Pre-warm: only start if not already running (outbound-call starts it earlier).
+    # For inbound calls (no prior outbound-call), seed the pre-warm language from ?lang.
+    global _prewarm_openai_task, _prewarm_language
     if not _prewarm_openai_task:
         elevenlabs_flag = use_elevenlabs_str == "true"
+        _prewarm_language = lang
         _prewarm_openai_task = asyncio.create_task(
-            _prewarm_openai_connection(_active_script, elevenlabs_flag)
+            _prewarm_openai_connection(_active_script, elevenlabs_flag, lang)
         )
 
     logger.info(f"Vobiz voice webhook called, script_active={_active_script is not None}")
@@ -688,6 +714,9 @@ async def make_outbound_call(request: Request):
         body = await request.json()
         to_number = body.get("to")
         use_elevenlabs = body.get("elevenlabs", False)
+        language = str(body.get("language", "en")).lower()
+        if language not in Config.SUPPORTED_LANGUAGES:
+            language = "en"
 
         if not to_number:
             return JSONResponse({"error": "Missing 'to' phone number"}, status_code=400)
@@ -706,14 +735,15 @@ async def make_outbound_call(request: Request):
             return JSONResponse({"error": msg}, status_code=503)
 
         # Pre-warm OpenAI connection NOW (while Vobiz dials + phone rings)
-        global _prewarm_openai_task, _prewarm_use_elevenlabs
+        global _prewarm_openai_task, _prewarm_use_elevenlabs, _prewarm_language
         _prewarm_use_elevenlabs = bool(use_elevenlabs)
+        _prewarm_language = language
         _prewarm_openai_task = asyncio.create_task(
-            _prewarm_openai_connection(_active_script, use_elevenlabs)
+            _prewarm_openai_connection(_active_script, use_elevenlabs, language)
         )
 
         el = 'true' if use_elevenlabs else 'false'
-        answer_url = f"{Config.SERVER_URL}/vobiz/voice?elevenlabs={el}"
+        answer_url = f"{Config.SERVER_URL}/vobiz/voice?elevenlabs={el}&lang={language}"
         hangup_url = f"{Config.SERVER_URL}/vobiz/call-status"
 
         payload = {
@@ -821,6 +851,7 @@ async def vobiz_media_stream(websocket: WebSocket):
     handler = VobizRealtimeHandler(
         use_elevenlabs=_prewarm_use_elevenlabs,
         active_script=_active_script,
+        language=_prewarm_language,
     )
 
     # Pass pre-warmed OpenAI connection if available
@@ -880,12 +911,16 @@ async def test_call_endpoint(websocket: WebSocket):
     logger.info("Test call WS connected (no Vobiz credits will be used)")
 
     # Pre-warm OpenAI connection for latency parity with real calls.
-    global _prewarm_openai_task, _prewarm_use_elevenlabs
+    global _prewarm_openai_task, _prewarm_use_elevenlabs, _prewarm_language
     use_elevenlabs = websocket.query_params.get("elevenlabs", "false").lower() == "true"
+    language = websocket.query_params.get("language", "en").lower()
+    if language not in Config.SUPPORTED_LANGUAGES:
+        language = "en"
     if not _prewarm_openai_task:
         _prewarm_use_elevenlabs = use_elevenlabs
+        _prewarm_language = language
         _prewarm_openai_task = asyncio.create_task(
-            _prewarm_openai_connection(_active_script, use_elevenlabs)
+            _prewarm_openai_connection(_active_script, use_elevenlabs, language)
         )
     prewarm_task = _prewarm_openai_task
     prewarm_flag = _prewarm_use_elevenlabs
@@ -897,6 +932,7 @@ async def test_call_endpoint(websocket: WebSocket):
             active_script=_active_script,
             prewarm_task=prewarm_task,
             prewarm_use_elevenlabs=prewarm_flag,
+            language=language,
         )
     except WebSocketDisconnect:
         logger.info("Test call WS disconnected")

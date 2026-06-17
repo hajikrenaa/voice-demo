@@ -79,13 +79,14 @@ async def run_test_call(
     active_script: Optional[dict],
     prewarm_task: Optional[asyncio.Task] = None,
     prewarm_use_elevenlabs: bool = False,
+    language: str = "en",
 ):
     """
     Bridge a browser WebSocket into a real VobizRealtimeHandler session.
 
     Browser protocol:
       Client -> server:
-        {"type": "start", "elevenlabs": bool}
+        {"type": "start", "elevenlabs": bool, "language": "en"|"ta"}
         {"type": "audio_chunk", "data": "<pcm16-24k-b64>"}
         {"type": "stop"}
       Server -> client:
@@ -125,9 +126,18 @@ async def run_test_call(
 
             if mtype == "start":
                 use_elevenlabs = bool(msg.get("elevenlabs", False))
+                # Language may be sent in the start message; fall back to the WS query
+                # param value passed into run_test_call.
+                msg_lang = msg.get("language")
+                call_lang = (
+                    msg_lang.lower()
+                    if isinstance(msg_lang, str) and msg_lang.lower() in {"en", "ta"}
+                    else language
+                )
                 handler = VobizRealtimeHandler(
                     use_elevenlabs=use_elevenlabs,
                     active_script=active_script,
+                    language=call_lang,
                 )
                 handler._transcript_callback = transcript_hook
 
@@ -150,11 +160,11 @@ async def run_test_call(
                         "streamId": stream_id,
                         "callId": call_id,
                     },
-                    "extra_headers": f"elevenlabs={el_hdr}",
+                    "extra_headers": f"elevenlabs={el_hdr},language={call_lang}",
                 })
                 logger.info(
                     f"Test call started — streamId={stream_id}, "
-                    f"elevenlabs={use_elevenlabs}, "
+                    f"elevenlabs={use_elevenlabs}, language={call_lang}, "
                     f"script={'yes' if active_script else 'no'}"
                 )
 

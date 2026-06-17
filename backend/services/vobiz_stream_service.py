@@ -93,7 +93,7 @@ def _extract_spelled_letters(transcript: str) -> Optional[str]:
     return None
 
 
-def _build_forced_confirmation(letters: str) -> str:
+def _build_forced_confirmation(letters: str, language: str = "en") -> str:
     """Return the EXACT sentence the AI must reply with.
 
     Letters are read back INDIVIDUALLY ("H, A, J, I, K") rather than as full
@@ -103,14 +103,33 @@ def _build_forced_confirmation(letters: str) -> str:
     which turned email confirmation into a ~2-minute loop.  The exact letters
     are still spoken verbatim, so letter-accuracy protection is preserved; only
     the delivery is shortened (~5s instead of ~17s).
+
+    Tamil callers spell English names/emails with English letter names, so the
+    letters are still read verbatim — only the surrounding sentence is Tamil.
     """
     spelled = ", ".join(letters)
+    if language == "ta":
+        return f"புரிஞ்சது, spelling-ஐ உறுதி செய்யறேன்: {spelled}. சரியா?"
     return f"Got it, let me confirm the spelling: {spelled}. Is that correct?"
 
 
-def _is_disengage_intent(transcript: str) -> bool:
+# Tamil "I want to end / call me later / I'm busy" phrases. Matched as substrings on
+# the transcript so colloquial variants are caught.
+DISENGAGE_PHRASES_TA = (
+    "பிறகு பேச", "பிறகு மாட்டி", "பிறகு கூப்பி", "அப்புறம் பேச", "அப்புறம் கூப்பி",
+    "அப்புறமா பேச", "வேற நேரம்", "வேற டைம்", "இப்போ முடியாது", "இப்போது முடியாது",
+    "இப்போ பிஸி", "பிஸியா இருக்க", "நேரம் இல்ல", "நேரமில்ல", "டைம் இல்ல", "time இல்ல",
+    "பின்னாடி பேச", "பின்னாடி கூப்பி", "பிறகு call", "later பேச",
+)
+
+
+def _is_disengage_intent(transcript: str, language: str = "en") -> bool:
     """True if caller's words indicate they want to end the call now."""
     lower = transcript.lower().strip()
+    if language == "ta":
+        # Tamil callers code-switch, so check both Tamil and English phrase lists.
+        if any(p in transcript for p in DISENGAGE_PHRASES_TA):
+            return True
     return any(phrase in lower for phrase in DISENGAGE_PHRASES)
 
 
@@ -129,11 +148,28 @@ _CLOSING_TOKENS = frozenset((
     "have", "day", "nice", "wonderful", "lovely", "for", "your", "time",
 ))
 
+# Tamil courtesy / closing tokens — the Tamil equivalent of _CLOSING_TOKENS, used
+# (combined with the English set, since Tamil callers code-switch) to decide whether a
+# post-goodbye utterance is just a sign-off. Kept conservative: one substantive Tamil
+# word makes the remark "not closing", so a real follow-up keeps the caller on the line.
+_CLOSING_TOKENS_TA = frozenset((
+    "நன்றி", "சரி", "சரிங்க", "ஓகே", "ஓக்கே", "பை", "பைபை", "வணக்கம்", "தாங்க்ஸ்",
+    "தேங்க்ஸ்", "தேங்க்யூ", "போய்ட்டு", "வரேன்", "வரேங்க", "போறேன்", "நல்லது",
+    "போதும்", "சூப்பர்", "ஆமா", "ம்", "ஓம்", "சரிசரி", "தாங்க்யூ",
+))
 
-def _is_closing_remark(transcript: str) -> bool:
+
+def _is_closing_remark(transcript: str, language: str = "en") -> bool:
     """True if the WHOLE utterance is just courtesy/closing words. Used only after
     the agent has already said goodbye, to decide whether the caller is simply
     signing off (proceed to hang up) or has a real follow-up (stay on the line)."""
+    if language == "ta":
+        # Tamil has no letter case; split on non-space/punct so Tamil graphemes survive.
+        words = re.findall(r"[^\s,.!?]+", transcript.lower())
+        if not words:
+            return False
+        allowed = _CLOSING_TOKENS_TA | _CLOSING_TOKENS
+        return all(w in allowed for w in words)
     words = re.findall(r"[a-z]+", transcript.lower())
     if not words:
         return False
@@ -234,14 +270,21 @@ class VobizRealtimeHandler:
 
     OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
-    def __init__(self, use_elevenlabs: bool = False, active_script: dict = None):
+    def __init__(self, use_elevenlabs: bool = False, active_script: dict = None,
+                 language: str = "en"):
         self.stream_id: Optional[str] = None
         self.call_id: Optional[str] = None
         self.openai_ws = None
         self._connected = False
         self._vobiz_ws = None
         self.use_elevenlabs = use_elevenlabs
-        self._elevenlabs_tts = ElevenLabsTTSService() if use_elevenlabs else None
+        # Per-call language ("en" | "ta"). Drives prompt, transcription, native voice,
+        # ElevenLabs voice and the goodbye/closing heuristics. May be overridden from
+        # the Vobiz stream `start` event's extra_headers (set by the answer_url).
+        self._language = language if language in Config.SUPPORTED_LANGUAGES else "en"
+        self._elevenlabs_tts = (
+            ElevenLabsTTSService(language=self._language) if use_elevenlabs else None
+        )
         self._elevenlabs_available = True
         self._openai_tts_client = None
         self._response_text_buffer = ""
@@ -317,10 +360,17 @@ class VobizRealtimeHandler:
             if str(elevenlabs_param).lower() == "true":
                 self.use_elevenlabs = True
 
-            # Ensure TTS worker is running if ElevenLabs mode (from constructor or extra_headers)
+            # Language (en|ta) from extra_headers — set by the answer_url for outbound
+            # calls / the test-call bridge. Falls back to whatever the constructor got.
+            lang_param = extra_headers.get("language") or extra_headers.get("lang")
+            if isinstance(lang_param, str) and lang_param.strip().lower() in Config.SUPPORTED_LANGUAGES:
+                self._language = lang_param.strip().lower()
+
+            # Ensure TTS worker is running if ElevenLabs mode (from constructor or extra_headers).
+            # (Re)create the service with the final language so the Tamil voice + language_code
+            # are applied even when the flag/language arrived via extra_headers.
             if self.use_elevenlabs and not self._tts_worker_task:
-                if not self._elevenlabs_tts:
-                    self._elevenlabs_tts = ElevenLabsTTSService()
+                self._elevenlabs_tts = ElevenLabsTTSService(language=self._language)
                 self._elevenlabs_available = True
                 self._tts_worker_task = asyncio.create_task(self._tts_worker())
 
@@ -412,6 +462,10 @@ class VobizRealtimeHandler:
 
     def _build_prompt(self) -> str:
         """Build system prompt from script config or use default."""
+        # Tamil calls use a separate builder so the proven English prompt below is
+        # never touched (zero regression risk on the English path).
+        if self._language == "ta":
+            return self._build_prompt_ta()
         if not self._script:
             return Config.SYSTEM_PROMPT
 
@@ -528,6 +582,145 @@ class VobizRealtimeHandler:
 
         return "\n\n".join(parts)
 
+    def _build_prompt_ta(self) -> str:
+        """Tamil-mode system prompt — colloquial spoken Tamil + Tanglish.
+
+        Kept entirely separate from the English _build_prompt. The core language
+        lock + register is written in Tamil (per OpenAI's Realtime prompting guidance:
+        an in-language lock reduces drift back to English on names/numbers/short turns);
+        the script's own welcome/questions/goal may be authored in English and the model
+        is told to deliver them in natural Tamil.
+        """
+        lang_lock = (
+            "நீங்க ஒரு உண்மையான மனிதர் மாதிரி live ஃபோன் கால்ல பேசறீங்க — அழைப்பவரோட "
+            "குரலை நேரடியா கேக்கறீங்க.\n"
+            "மொழி விதி (கண்டிப்பா கடைபிடிங்க): எப்பவும் இயல்பான, அன்றாட பேச்சுத் தமிழ்ல "
+            "மட்டுமே பதில் சொல்லுங்க. செந்தமிழ் / எழுத்துத் தமிழ் / கவிதை நடை வேண்டாம். "
+            "அழைப்பவர் ஆங்கிலத்துல பேசினாலும் நீங்க தமிழ்லயே பதில் சொல்லுங்க.\n"
+            "Tanglish சரி: எண்கள், brand/technical வார்த்தைகள் (OTP, email, payment link, "
+            "WhatsApp மாதிரி) ஆங்கிலத்துலயே வையுங்க — அதை கஷ்டப்பட்டு தமிழ்ல மொழிபெயர்க்காதீங்க. "
+            "ஆனா ஒரு பெயர், எண், அல்லது 'ok/sorry/thanks' மாதிரி ஒரு வார்த்தைக்காக முழு பதிலையும் "
+            "ஆங்கிலத்துக்கு மாத்தாதீங்க — தமிழ்லயே தொடருங்க.\n"
+            "மரியாதை: 'நீங்க'ன்னு கூப்பிடுங்க (ஒருபோதும் 'நீ' வேண்டாம்), '-ங்க' சேர்த்து பேசுங்க "
+            "(சொல்லுங்க, வாங்க). ஒரு தடவைக்கு 1-2 சின்ன வாக்கியம் மட்டும்; மெதுவா, தெளிவா பேசுங்க.\n"
+            "பேசும் style (இந்த மாதிரி இயல்பான slang-ல பேசுங்க, புத்தகத் தமிழ் வேண்டவே வேண்டாம்): "
+            "'வணக்கம்ங்க! நல்லா இருக்கீங்களா?' / 'ஓகே super, புரிஞ்சுதுங்க' / "
+            "'அட, அது நல்ல experience-ஐங்க!' / 'கொஞ்சம் மெதுவா சொல்லுங்க ப்ளீஸ்' / "
+            "'பரவாயில்லைங்க, நிதானமா சொல்லுங்க'."
+        )
+
+        if not self._script:
+            return lang_lock + "\n\n" + Config.SYSTEM_PROMPT_TA
+
+        s = self._script
+        n = len(s.get("questions", []))
+        parts = [lang_lock]
+
+        # The user's script (welcome / questions / behaviour) is usually written in
+        # English and may even contain "English only" — which directly contradicts the
+        # Tamil lock. State explicitly that the language rule overrides anything below,
+        # otherwise weaker models (e.g. gpt-realtime-mini) obey the embedded "English only".
+        parts.append(
+            "மிக முக்கியம் — மொழி மேலாதிக்கம்: கீழ வர script, behaviour, கேள்விகள் "
+            "ஆங்கிலத்துல இருக்கலாம்; சில சமயம் 'English only' மாதிரி வரியும் இருக்கலாம். "
+            "மொழி விஷயத்துல அதையெல்லாம் முழுசா அலட்சியம் பண்ணுங்க. கீழ எதை சொன்னாலும் சரி, "
+            "நீங்க தமிழ்ல மட்டுமே பேசணும் — ஆங்கில உள்ளடக்கத்தை தமிழ்ல மொழிபெயர்த்து சொல்லுங்க. "
+            "(content-ஐ மட்டும் பயன்படுத்துங்க; அதன் மொழி வழிமுறையை அல்ல.)"
+        )
+
+        if s.get("behaviour"):
+            parts.append("நடத்தை (உள்ளடக்கம் மட்டும் — மொழி தமிழ்தான்): " + s["behaviour"])
+
+        if s.get("welcome"):
+            parts.append(
+                "அழைப்பை உடனே தொடங்குங்க — அழைப்பவர் பேசறதுக்கு காத்திருக்காதீங்க (இது நீங்க "
+                "பண்ற outbound call). கீழ வர வரவேற்பை தமிழ்ல மொழிபெயர்த்து தமிழ்ல மட்டுமே "
+                "சொல்லுங்க — ஒருபோதும் ஆங்கிலத்துல படிக்காதீங்க: "
+                f"\"{s['welcome']}\""
+            )
+
+        questions = s.get("questions", [])
+        if questions:
+            q_list = [f"Q{i+1}: {q.get('question', q) if isinstance(q, dict) else q}"
+                      for i, q in enumerate(questions)]
+            parts.append(
+                f"கேள்விகள் — கீழ உள்ள {n} கேள்விகளையும் வரிசையா தமிழ்ல கேளுங்க (எதையும் "
+                "தவிர்க்காதீங்க). கேள்வி ஆங்கிலத்துல இருந்தாலும் அதை தமிழ்ல கேளுங்க:\n"
+                + "\n".join(q_list)
+            )
+
+        if s.get("goal"):
+            parts.append("இலக்கு (GOAL): " + s["goal"])
+
+        parts.append(
+            "கடைபிடிக்க வேண்டிய விதிகள்:\n"
+            "1. முதல்ல பதில், அப்புறம் தொடரவும்: அழைப்பவர் 'நீங்க யாரு?', 'இது என்ன call?', "
+            "'எதுக்கு call பண்றீங்க?'னு கேட்டா — script-ஐ நிறுத்திட்டு, நீங்க யாரு, எதைப் பத்தி "
+            "call பண்றீங்கனு சுருக்கமா சொல்லி 'தொடரலாமா?'னு கேளுங்க. சம்மதிச்ச பிறகே கேள்விகளை தொடருங்க.\n"
+            "2. தற்போதைய கேள்விக்கு பதில் வந்த பிறகே அடுத்த கேள்விக்கு போங்க. கேள்வி, புகார், "
+            "'கேக்கலை' — இது பதில் இல்ல; அதை கவனிச்சு, மறுபடி கேளுங்க.\n"
+            "3. அழைப்பவர் 'இல்ல', 'தப்பு', 'அது சரியில்ல'னு சொன்னா — நிறுத்துங்க. மன்னிப்பு கேட்டு "
+            "மறுபடி கேளுங்க. உங்க தப்பான பதிலை மறுபடி சொல்லாதீங்க; அடுத்த கேள்விக்கு போகாதீங்க.\n"
+            "4. உறுதி செய்யும்போது அழைப்பவர் சொன்ன அதே மதிப்பை அப்படியே சொல்லுங்க — எண், அளவு, "
+            "பெயர் எதையும் மாத்தாதீங்க (8 = 8, 7 இல்ல).\n"
+            "5. அழைப்பவர் எரிச்சல்படா இருந்தா — புரிஞ்சுக்கிட்டு, மன்னிப்பு கேட்டு, தொடரலாமானு கேளுங்க.\n"
+            "6. ஆடியோ சரியில்லைனா / மறுபடி சொல்லச் சொன்னா — மன்னிப்பு கேட்டு கடைசி கேள்வியை மறுபடி சொல்லுங்க.\n"
+            "7. அழைப்பவர் சொன்னதை திருத்தினா (முன்ன சொன்னதுக்கு மாறா) — புது மதிப்பையே எடுத்துக்கங்க, "
+            "'புரிஞ்சது, [புது மதிப்பு] — நன்றி'னு உறுதி செய்யுங்க.\n"
+            "8. 'ஹலோ?', 'இருக்கீங்களா?'னு கேட்டா — முழு அறிமுகத்தையும் மறுபடி சொல்லாதீங்க; "
+            "'ஆமா, கேக்குது சொல்லுங்க'னு சொல்லி எங்க நிறுத்தினீங்களோ அங்கருந்து தொடருங்க.\n"
+            "\n"
+            "பெயர் & மின்னஞ்சல் — மிக முக்கியம்:\n"
+            "1. பெயரை யூகிக்காதீங்க. அழைப்பவர் பெயரை சொன்னதும் ஒரு தடவை திரும்ப சொல்லி உறுதி செய்யுங்க: "
+            "'புரிஞ்சது, பிரியா — சரியா?'. சரின்னா அடுத்த கேள்விக்கு போங்க; spelling கேக்காதீங்க.\n"
+            "2. ஆங்கிலப் பெயர்/மின்னஞ்சலை spell பண்ணும்போது ஆங்கில எழுத்துகளையே பயன்படுத்துங்க. "
+            "புரியாத எழுத்துக்கு 'B as in Bombay, V as in Victor, S as in Sugar' மாதிரி சொல்லுங்க.\n"
+            "3. மின்னஞ்சல்: '@' = 'at the rate', '.' = 'dot'. டொமைனை முழு வார்த்தையா சொல்லுங்க "
+            "('gmail dot com'); @-க்கு முன் உள்ள பகுதியை மட்டும் எழுத்து எழுத்தா உறுதி செய்யுங்க. "
+            "எதையும் auto-complete பண்ணாதீங்க.\n"
+            "\n"
+            "எண், தேதி, பணம்:\n"
+            "- ஃபோன் நம்பர் / OTP-ஐ ஒவ்வொரு இலக்கமா, இடைவெளி விட்டு சொல்லுங்க (பூஜ்ஜியம், ஒன்னு, "
+            "ரெண்டு, மூணு, நாலு, அஞ்சு, ஆறு, ஏழு, எட்டு, ஒம்பது). சொல்லி திரும்ப உறுதி செய்யுங்க.\n"
+            "- பணம் இந்திய முறையில (லட்சம், கோடி) — 'million/billion' வேண்டாம்.\n"
+            "- தேதி: நாள், மாதம் (தமிழ்ல), வருஷம் வரிசையில.\n"
+            "\n"
+            "எந்த பெயர்/எண்/மின்னஞ்சல்/தொகை/தேதியையும் சொன்ன பிறகு 'சரியா?'னு உறுதி கேளுங்க. "
+            "திருத்தினா அந்த ஒரு விஷயத்தை மட்டும் சரிசெய்யுங்க.\n"
+            "\n"
+            "உரையாடல் ஓட்டம்:\n"
+            f"- எல்லா {n} கேள்விகளுக்கும் பதில் வந்து உறுதியான பிறகு, சேகரிச்ச எல்லாத்தையும் சுருக்கமா "
+            "recap பண்ணி 'எல்லாம் சரியா?'னு கேளுங்க.\n"
+            "- கால் முடிக்கிறது: எல்லா கேள்விகளும் முடிஞ்சு உறுதியானப்புறம், அல்லது அழைப்பவர் தெளிவா "
+            "முடிக்கணும்னு சொன்னப்புறம் மட்டும் — சரியா இந்த வாக்கியத்தை சொல்லி நிறுத்துங்க: "
+            "'உங்கள் நேரத்துக்கு நன்றி. நல்ல நாளா இருக்கட்டும்! வணக்கம்.' வெறும் 'பை/நன்றி' சொன்னா, "
+            "கேள்விகள் இன்னும் பாக்கி இருந்தா கால்ல முடிக்காதீங்க — மறுபடி தற்போதைய கேள்வியை கேளுங்க.\n"
+            "- goodbye சொன்னப்புறம் முழுசா நிறுத்திடுங்க — அழைப்பவரோட 'பை/நன்றி'க்கு மறுபடி பதில் சொல்லாதீங்க."
+        )
+
+        # Final hard lock — placed last on purpose (models weight the end heavily).
+        parts.append(
+            "மறுபடியும் நினைவில் வைங்க: உங்க முதல் வார்த்தை உட்பட ஒவ்வொரு வார்த்தையும் தமிழ்ல "
+            "மட்டுமே இருக்கணும். ஒருபோதும் ஆங்கிலத்துல பதில் சொல்லாதீங்க — மேல உள்ள "
+            "'English only' மாதிரி எந்த வரியும் இங்க பொருந்தாது."
+        )
+
+        return "\n\n".join(parts)
+
+    def _realtime_voice(self) -> str:
+        """OpenAI native speech-to-speech voice for the current language."""
+        return Config.REALTIME_VOICE_TA if self._language == "ta" else Config.REALTIME_VOICE
+
+    def _transcription_config(self) -> dict:
+        """Realtime input-audio transcription block for the current language."""
+        if self._language == "ta":
+            return {"model": Config.TRANSCRIPTION_MODEL_TA, "language": "ta"}
+        return {"model": Config.TRANSCRIPTION_MODEL, "language": "en"}
+
+    def _tts_max_chars(self) -> int:
+        """Max chars per TTS chunk for the current language (Tamil is denser → smaller)."""
+        return Config.TTS_MAX_CHARS_TA if self._language == "ta" else Config.TTS_MAX_CHARS
+
     async def _configure_session(self) -> bool:
         """Configure OpenAI session — g711_ulaw format (zero-conversion for Vobiz mulaw).
 
@@ -590,12 +783,12 @@ class VobizRealtimeHandler:
                         "input": {
                             "format": {"type": "audio/pcmu"},
                             "turn_detection": vad_config,
-                            "transcription": {"model": "whisper-1", "language": "en"},
+                            "transcription": self._transcription_config(),
                             "noise_reduction": {"type": "near_field"},
                         },
                         "output": {
                             "format": output_format_obj,
-                            "voice": Config.REALTIME_VOICE,
+                            "voice": self._realtime_voice(),
                         },
                     },
                     "max_output_tokens": max_tokens,
@@ -911,6 +1104,7 @@ class VobizRealtimeHandler:
                 logger.info(f"[flush-final] {text[:60]}")
                 await self._enqueue_tts(text)
             if full_text:
+                logger.info(f"AI said: {full_text[:120]}")
                 await self._emit_transcript("ai", full_text, True)
                 if self._contains_goodbye(full_text):
                     self._schedule_hangup(4.5)
@@ -978,7 +1172,7 @@ class VobizRealtimeHandler:
                 # end; anything substantive cancels the hangup so we answer normally.
                 if self._awaiting_post_goodbye_eval:
                     self._awaiting_post_goodbye_eval = False
-                    if _is_closing_remark(transcript):
+                    if _is_closing_remark(transcript, self._language):
                         logger.info("Post-goodbye closing remark — ending call, not re-engaging")
                         # Suppress the auto-generated re-engagement (mirror welcome barge-in).
                         self._drain_tts_queue()
@@ -1005,8 +1199,24 @@ class VobizRealtimeHandler:
                     await self._restart_session()
                     return
 
-                if _is_disengage_intent(transcript):
+                if _is_disengage_intent(transcript, self._language):
                     logger.info(f"DISENGAGE intent in '{transcript[:60]}' — injecting goodbye")
+                    if self._language == "ta":
+                        disengage_text = (
+                            "[அழைப்பவர் இப்போ call-ஐ முடிக்க விரும்பறாங்க. உங்க அடுத்த பதில் "
+                            "சரியா இப்படி மட்டும் இருக்கணும்: \"பரவாயில்லைங்க! உங்க நேரத்துக்கு "
+                            "ரொம்ப நன்றி. பிறகு வசதியான நேரத்துல பேசலாம், நல்ல நாளா இருங்க!\" "
+                            "வேற எந்த கேள்வியும் கேக்காதீங்க. வேற எதுவும் சேர்க்காதீங்க. "
+                            "இந்த ஒரு வாக்கியத்தை மட்டும் சொல்லி நிறுத்துங்க.]"
+                        )
+                    else:
+                        disengage_text = (
+                            "[The caller wants to end this call now. Your VERY NEXT response "
+                            "MUST be exactly: \"No problem at all. Thank you for your time. "
+                            "Have a great day! Goodbye.\" "
+                            "Do NOT ask any more questions. Do NOT offer to schedule. "
+                            "Do NOT add anything else. Just say that one sentence and stop.]"
+                        )
                     try:
                         ws = self.openai_ws
                         if ws:
@@ -1017,13 +1227,7 @@ class VobizRealtimeHandler:
                                     "role": "system",
                                     "content": [{
                                         "type": "input_text",
-                                        "text": (
-                                            "[The caller wants to end this call now. Your VERY NEXT response "
-                                            "MUST be exactly: \"No problem at all. Thank you for your time. "
-                                            "Have a great day! Goodbye.\" "
-                                            "Do NOT ask any more questions. Do NOT offer to schedule. "
-                                            "Do NOT add anything else. Just say that one sentence and stop.]"
-                                        ),
+                                        "text": disengage_text,
                                     }],
                                 },
                             }))
@@ -1032,7 +1236,7 @@ class VobizRealtimeHandler:
 
                 letters = _extract_spelled_letters(transcript)
                 if letters:
-                    confirmation = _build_forced_confirmation(letters)
+                    confirmation = _build_forced_confirmation(letters, self._language)
                     try:
                         ws = self.openai_ws
                         if ws:
@@ -1181,7 +1385,7 @@ class VobizRealtimeHandler:
         # go out as one giant un-interruptible blob (the 28s-chunk bug). Flush it
         # early once it exceeds the cap, keeping the trailing partial word in the
         # buffer so we never synthesize a mid-word fragment that is still streaming.
-        if len(self._response_text_buffer) > Config.TTS_MAX_CHARS:
+        if len(self._response_text_buffer) > self._tts_max_chars():
             buf = self._response_text_buffer
             cut = buf.rfind(" ")
             if cut > 0:
@@ -1196,7 +1400,7 @@ class VobizRealtimeHandler:
         chunk is queued separately, so an interrupt's _drain_tts_queue() can stop
         the remaining chunks mid-utterance.
         """
-        for piece in _split_for_tts(text, Config.TTS_MAX_CHARS):
+        for piece in _split_for_tts(text, self._tts_max_chars()):
             try:
                 await asyncio.wait_for(self._tts_queue.put(piece), timeout=2.0)
             except asyncio.TimeoutError:
@@ -1297,6 +1501,15 @@ class VobizRealtimeHandler:
 
     def _contains_goodbye(self, text: str) -> bool:
         lower = text.lower()
+        if self._language == "ta":
+            # The Tamil prompt is told to close with "உங்கள் நேரத்துக்கு நன்றி" — an
+            # unambiguous farewell that won't appear in a greeting (so the welcome won't
+            # trigger a hangup). Also catch an English "goodbye" in case it code-switches.
+            if "நேரத்துக்கு நன்றி" in text or "நேரத்திற்கு நன்றி" in text:
+                return True
+            if "goodbye" in lower or "good bye" in lower:
+                return True
+            return False
         if "goodbye" in lower or "good bye" in lower or "farewell" in lower:
             return True
         if "thank you for your time" in lower and (
