@@ -154,8 +154,10 @@ def test_interrupt_recovery_reports_heard_vs_unheard():
         text = injected[0]["item"]["content"][0]["text"]
         # Tells the model exactly what the caller DID hear...
         assert "சரி, note பண்ணிட்டேன்." in text
-        # ...and to re-say the unheard part instead of abandoning it.
-        assert "மறுபடி சொல்லுங்க" in text
+        # ...and caps the re-delivery to one short sentence instead of a full
+        # restart (2026-07-11: "say it again" wording caused 5x intro replays).
+        assert "ஒரு சின்ன" in text
+        assert "narration வேண்டாம்" in text
         # The old blanket ban that made the agent "forget" unheard questions is gone.
         assert "Never go back" not in text
 
@@ -953,3 +955,95 @@ def test_completed_response_tail_is_flushed_at_done():
         assert handler._cancel_requested is False
 
     asyncio.run(scenario())
+
+
+def test_refusals_are_disengage_intents():
+    # Live 2026-07-11 13:01: "No, I not interested. Thank you." matched no
+    # disengage phrase — the agent replied "no problem, could you share your
+    # name?" and the caller hung up.
+    from services.vobiz_stream_service import _is_disengage_intent
+
+    assert _is_disengage_intent("No, I not interested. Thank you.")
+    assert _is_disengage_intent("I'm not interested in this job")
+    assert _is_disengage_intent("please stop calling me")
+    assert _is_disengage_intent("you have the wrong number")
+    assert _is_disengage_intent("I don't want this")
+    # Positive engagement must not match.
+    assert not _is_disengage_intent("yes I am interested")
+    assert not _is_disengage_intent("sounds interesting, tell me more")
+
+
+def test_disengage_cancels_inflight_response_and_forces_goodbye():
+    # The server-VAD auto-answer races the disengage injection; it must be
+    # cancelled (and re-created) so the scripted goodbye plays instead of a
+    # free-styled pushy follow-up.
+    class FakeOpenAIWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, message):
+            self.sent.append(json.loads(message))
+
+    class FakeVobiz:
+        async def send_json(self, message):
+            return None
+
+    async def scenario():
+        handler = VobizRealtimeHandler(use_elevenlabs=True)
+        ws = FakeOpenAIWebSocket()
+        handler.openai_ws = ws
+        handler._vobiz_ws = FakeVobiz()
+        handler.stream_id = "stream-1"
+        handler._is_first_response = False
+        handler._ai_is_responding = True
+
+        await handler._handle_openai_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "No, I not interested. Thank you.",
+        })
+
+        types = [m.get("type") for m in ws.sent]
+        assert "conversation.item.create" in types   # goodbye instruction injected
+        assert "response.cancel" in types            # pushy auto-answer cancelled
+        assert handler._response_create_pending is True
+
+        # With no response in flight, the goodbye must be nudged out directly.
+        handler2 = VobizRealtimeHandler(use_elevenlabs=True)
+        ws2 = FakeOpenAIWebSocket()
+        handler2.openai_ws = ws2
+        handler2._vobiz_ws = FakeVobiz()
+        handler2.stream_id = "stream-2"
+        handler2._is_first_response = False
+        handler2._ai_is_responding = False
+
+        await handler2._handle_openai_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "I am busy now, call me later",
+        })
+        assert {"type": "response.create"} in ws2.sent
+
+    asyncio.run(scenario())
+
+
+def test_recovery_text_bans_full_reintroduction():
+    # Live 2026-07-11: "say it again naturally" made the mini model re-deliver
+    # the whole pitch ("Let me start over...") after every hello-barge-in.
+    handler = VobizRealtimeHandler(use_elevenlabs=True)
+    handler._heard_text_this_response = "Hi!"
+    handler._unheard_text_this_response = "This is Akash calling from Zillion Connects."
+
+    text = handler._build_interrupt_recovery()
+
+    assert "ONE short sentence" in text
+    assert "let me start over" in text          # listed as a banned phrase
+    assert "SHORTER" in text
+    assert "full pitch" in text
+
+
+def test_english_transcription_config_pins_language_and_prompt():
+    # Foreign-script hallucinations ("hello?" → "哈喽"/"Борил?") poisoned the
+    # transcript-based intent checks — the EN config biases the decoder.
+    handler = VobizRealtimeHandler(use_elevenlabs=True, language="en")
+    cfg = handler._transcription_config()
+    assert cfg["language"] == "en"
+    assert "English" in cfg.get("prompt", "")

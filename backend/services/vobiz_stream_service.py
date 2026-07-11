@@ -68,6 +68,13 @@ DISENGAGE_PHRASES = (
     "i have to go", "i gotta go", "gotta go", "got to go", "i need to go",
     "schedule another time", "schedule later", "schedule it later",
     "can we do this later", "later please", "another time",
+    # Outright refusals — live call 2026-07-11 13:01: "No, I not interested.
+    # Thank you." matched nothing here, so the agent answered with "no problem,
+    # could you share your name?" and the caller hung up. In a job-outreach
+    # call these are unambiguous end-the-call signals.
+    "not interested", "no interest", "don't want", "dont want",
+    "not looking for", "wrong number", "don't call", "dont call",
+    "stop calling", "remove my number", "leave me alone",
 )
 
 
@@ -824,6 +831,14 @@ class VobizRealtimeHandler:
             "(you said '500 to 1000', they say '500 to 1500'), they are CORRECTING you. Immediately say "
             "the NEW value back ('Got it, 500 to 1500 — thank you') and use it from then on. Never ignore "
             "a restated number or keep your old value.\n"
+            "11. UNCLEAR SPEECH: If you could not clearly understand what the caller said — mumbled, "
+            "noisy, cut off — say 'Sorry, I didn't catch that — could you say that again?' and re-ask. "
+            "NEVER pretend you understood. NEVER say 'thank you for confirming' unless they clearly "
+            "said yes/correct. NEVER guess a name, number, or amount you did not clearly hear — asking "
+            "them to repeat is always better than confirming a wrong value.\n"
+            "12. NO SELF-NARRATION: Never say 'let me start over', 'let me clarify', 'I'll explain "
+            "again', 'let me introduce myself again', or any commentary about what you are doing. "
+            "Just say the content directly — humans don't announce their sentences.\n"
             "\n"
             "NAMES AND EMAILS — CRITICAL ACCURACY RULES:\n"
             "Phone audio is LOW quality. Single letters sound identical (B/D/P/T, M/N, S/F). "
@@ -1150,7 +1165,10 @@ class VobizRealtimeHandler:
             if Config.TRANSCRIPTION_PROMPT_TA:
                 cfg["prompt"] = Config.TRANSCRIPTION_PROMPT_TA
             return cfg
-        return {"model": Config.TRANSCRIPTION_MODEL, "language": "en"}
+        cfg = {"model": Config.TRANSCRIPTION_MODEL, "language": "en"}
+        if Config.TRANSCRIPTION_PROMPT:
+            cfg["prompt"] = Config.TRANSCRIPTION_PROMPT
+        return cfg
 
     def _preferred_turn_detection_config(self) -> dict:
         if Config.VAD_TYPE == "semantic_vad":
@@ -1840,6 +1858,30 @@ class VobizRealtimeHandler:
                                     }],
                                 },
                             }))
+                            # The server-VAD auto-answer for this turn raced the
+                            # injection — it never saw the goodbye script and
+                            # free-styles something pushy ("no problem, could you
+                            # share your name?", live 2026-07-11 13:01, caller
+                            # hung up). Drop its audio and re-create so the
+                            # polite goodbye plays instead.
+                            self._drain_tts_queue()
+                            self._response_text_buffer = ""
+                            self._pending_audio_deltas.clear()
+                            await self._clear_vobiz_audio()
+                            if self._ai_is_responding:
+                                self._suppress_recovery_once = True
+                                self._cancel_requested = True
+                                await ws.send(json.dumps({"type": "response.cancel"}))
+                                self._response_create_pending = True
+                                logger.info(
+                                    "Cancelled in-flight response — re-creating "
+                                    "so the goodbye applies now"
+                                )
+                            else:
+                                # Turn already answered (or no response yet) —
+                                # without a nudge the goodbye instruction sits
+                                # unused until the caller speaks again.
+                                await ws.send(json.dumps({"type": "response.create"}))
                     except Exception as e:
                         logger.debug(f"Could not inject disengage instruction: {e}")
 
@@ -2127,13 +2169,18 @@ class VobizRealtimeHandler:
             return (
                 "[அழைப்பவர் உங்க பேச்சை நடுவுல cut பண்ணிட்டாங்க. " + heard_line +
                 unheard_line +
-                "Play ஆகாத பேச்சை சொன்னதா நினைக்காதீங்க. முதல்ல அவங்க இப்போ "
-                "சொன்னதுக்கு பதில் சொல்லுங்க. அப்புறம் play ஆகாத பகுதியில "
-                "முக்கியமான விஷயம் இருந்தா — உங்க அறிமுகமோ, கேள்வியோ, "
-                "information-ஓ — அதை வேற வார்த்தைல இயல்பா மறுபடி சொல்லுங்க "
-                "(அவங்க அதை கேக்கவே இல்லை). அவங்க ஏற்கனவே கேட்ட பகுதியை மட்டும் "
-                "திரும்ப சொல்லாதீங்க; கேக்காத பகுதியை skip பண்ணி அடுத்த topic-க்கு "
-                "தாவிடாதீங்க. அவங்க சொன்னது புரியலைனா புரிஞ்ச மாதிரி பேசாம "
+                "Play ஆகாத பேச்சை சொன்னதா நினைக்காதீங்க. அடுத்த பதிலுக்கான rules:\n"
+                "1. முதல்ல அவங்க இப்போ சொன்னதுக்கு பதில் சொல்லுங்க.\n"
+                "2. அவங்க 'hello?'னு மட்டும் சொன்னா அல்லது யாருனு கேட்டா: ஒரே ஒரு "
+                "சின்ன வாக்கியத்துல (பேரு, company, ஏன் call பண்றீங்க) சொல்லிட்டு "
+                "உங்க கேள்வியை கேளுங்க. முழு pitch-ஐயும் திரும்ப சொல்ல வேண்டாம்.\n"
+                "3. இல்லைனா play ஆகாத முக்கியமான விஷயத்தை அதிகபட்சம் ஒரு சின்ன "
+                "வாக்கியத்துல வேற வார்த்தைல சொல்லுங்க — எல்லாத்தையும் திரும்ப "
+                "சொல்லாதீங்க.\n"
+                "4. 'முதல்ல இருந்து சொல்றேன்', 'திரும்ப அறிமுகம் பண்ணிக்கிறேன்' "
+                "மாதிரி narration வேண்டாம் — நேரடியா விஷயத்தை சொல்லுங்க.\n"
+                "5. திரும்பவும் interrupt ஆனா ஒவ்வொரு தடவையும் இன்னும் சுருக்கமா "
+                "பேசுங்க. அவங்க சொன்னது புரியலைனா புரிஞ்ச மாதிரி பேசாம "
                 "'sorry-ங்க, என்ன சொன்னீங்க?'னு கேளுங்க.]"
             )
         if not self.use_elevenlabs:
@@ -2152,14 +2199,25 @@ class VobizRealtimeHandler:
         unheard_line = (
             f'This part was NEVER played to them: "{unheard}". ' if unheard else ""
         )
+        # Live calls 2026-07-11: the old "say it again naturally" wording made
+        # the mini model re-deliver the ENTIRE pitch with meta-commentary
+        # ("Let me start over", "I'll explain again") after every "hello?" —
+        # the intro played up to 5x in one call and callers hung up. The rules
+        # below cap the re-delivery and ban the meta-speech.
         return (
             "[You were interrupted mid-reply. " + heard_line + unheard_line +
-            "Do NOT treat the unplayed part as said. First answer what the "
-            "caller just said. Then, if the unplayed part contained something "
-            "important — your introduction, a question, or information — say it "
-            "again naturally in fresh words (they never heard it). Do not "
-            "repeat the part they already heard, and do not skip ahead as if "
-            "the unheard part was delivered.]"
+            "Do NOT treat the unplayed part as said. Rules for your next reply:\n"
+            "1. First respond to what the caller just said.\n"
+            "2. If they only said 'hello?' / a greeting / asked who you are: "
+            "answer in ONE short sentence (your name, company, reason) and ask "
+            "your pending question. Do NOT re-deliver your full pitch.\n"
+            "3. Otherwise fold the ESSENTIAL unplayed info into at most ONE "
+            "short sentence in fresh words — never restate everything.\n"
+            "4. NEVER narrate what you are doing. Banned phrases: 'let me start "
+            "over', 'let me introduce myself again', 'I'll explain again', "
+            "'let me clarify', 'starting fresh'. Just say the content.\n"
+            "5. If you get interrupted again, your replies must get SHORTER "
+            "each time, never longer.]"
         )
 
     async def _forward_response_audio(self, audio_b64: str):

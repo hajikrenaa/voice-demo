@@ -184,6 +184,18 @@ class Config:
         "English words, names, emails, numbers and spelled-out letters "
         "(example: H-A-J-I-K) in English letters exactly as spoken.",
     )
+    # Bias prompt for English-call transcription. Even with language="en" pinned,
+    # gpt-4o-mini-transcribe hallucinated foreign scripts for short Indian-English
+    # utterances on live calls 2026-07-11 ("hello?" → "哈喽"/"ฮัลโหล"/"Борил?",
+    # "yeah" → "네?"), which poisoned the disengage/closing intent checks that run
+    # on the transcript. A domain prompt biases the decoder to Latin script.
+    TRANSCRIPTION_PROMPT = os.getenv(
+        "TRANSCRIPTION_PROMPT",
+        "English phone call in India about a job opportunity; the caller has an "
+        "Indian accent. Short utterances like 'hello?', 'yeah', 'okay', 'hmm' "
+        "are common — transcribe them as English words, never in a foreign "
+        "script. Keep names, emails and spelled-out letters exactly as spoken.",
+    )
 
     # Vobiz Audio Settings (mulaw 8kHz — zero-conversion)
     VOBIZ_SAMPLE_RATE = 8000  # Vobiz supports audio/x-mulaw;rate=8000
