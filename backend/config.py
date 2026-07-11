@@ -1,8 +1,13 @@
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables. override=True makes the .env FILE the single
+# source of truth: in Docker, `env_file:` freezes values into the container
+# environment at CREATION time, and without override those stale values beat
+# the bind-mounted /app/.env — a UI settings save survived deploys (file
+# write-through) but silently reverted on a bare `docker restart` (observed
+# 2026-07-12: speaker saved as karun, fresh processes still saw manisha).
+load_dotenv(override=True)
 
 class Config:
     """Application configuration"""
