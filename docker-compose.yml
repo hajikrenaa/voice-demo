@@ -6,6 +6,10 @@ services:
       - ./backend/.env
     volumes:
       - backend-data:/app/data
+      # .env is excluded from the image (backend/.dockerignore) — bind-mount it so
+      # the UI's "API Keys & Configuration" tab (PUT /api/settings writes /app/.env)
+      # persists key changes to the HOST file, surviving restarts and redeploys.
+      - ./backend/.env:/app/.env
     ports:
       - "8000:8000"
     restart: unless-stopped
