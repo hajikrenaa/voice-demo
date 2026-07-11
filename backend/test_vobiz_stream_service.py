@@ -1047,3 +1047,50 @@ def test_english_transcription_config_pins_language_and_prompt():
     cfg = handler._transcription_config()
     assert cfg["language"] == "en"
     assert "English" in cfg.get("prompt", "")
+
+
+def test_normalize_phone_number_defaults_to_india():
+    # Live 2026-07-11 13:20: '+7010873682' (bare + before a 10-digit Indian
+    # mobile) went out with a Russia prefix instead of +91.
+    from main import _normalize_phone_number
+
+    assert _normalize_phone_number("+7010873682") == "+917010873682"
+    assert _normalize_phone_number("7010873682") == "+917010873682"
+    assert _normalize_phone_number("07010873682") == "+917010873682"
+    assert _normalize_phone_number("917010873682") == "+917010873682"
+    assert _normalize_phone_number("+917010873682") == "+917010873682"
+    assert _normalize_phone_number("70108 73682") == "+917010873682"
+    # Genuine international numbers pass through untouched.
+    assert _normalize_phone_number("+14155551234") == "+14155551234"
+    assert _normalize_phone_number("+79261234567") == "+79261234567"
+    assert _normalize_phone_number("") == ""
+
+
+def test_tts_stale_check_holds_current_speech_through_watchdog_window():
+    # Live 2026-07-11 02:13: with a lost speech_stopped, the old 1.5s stale
+    # bound dropped the reply's lead-in a second before the 2.5s watchdog
+    # cleared the stuck flag ("Sure, take your time." swallowed, ~3.5s dead
+    # air). Current-generation speech must be HELD until the flag resolves.
+    async def scenario():
+        handler = VobizRealtimeHandler(use_elevenlabs=True)
+        handler._interrupt_pending = True
+        generation = handler._tts_generation
+
+        async def clear_flag_late():
+            await asyncio.sleep(2.0)  # past the old 1.5s drop bound
+            handler._interrupt_pending = False
+
+        asyncio.create_task(clear_flag_late())
+        assert await handler._tts_utterance_stale(generation) is False
+
+        # A real interruption ruling (generation bump) still marks it stale.
+        handler._interrupt_pending = True
+
+        async def bump():
+            await asyncio.sleep(0.2)
+            handler._drain_tts_queue()
+
+        asyncio.create_task(bump())
+        assert await handler._tts_utterance_stale(generation) is True
+
+    asyncio.run(scenario())

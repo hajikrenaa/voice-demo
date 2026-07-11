@@ -2655,15 +2655,22 @@ class VobizRealtimeHandler:
         (one full Sarvam connect+synth+discard cycle per sentence, ~800ms each).
         Bounded wait so a stuck flag can never wedge the TTS worker.
         """
+        # The wait must outlast the lost-speech_stopped watchdog (2.5s): the
+        # old 1.5s bound dropped CURRENT-generation speech a full second before
+        # the watchdog could clear a stuck flag — live call 2026-07-11 02:13:
+        # a "Mm." backchannel with a lost stop event swallowed "Sure, take
+        # your time." and left ~3.5s of dead air. If no interruption ruling
+        # ever bumps the generation, this utterance is still the current
+        # answer — keep holding it. Waiting is safe: the caller is (believed)
+        # speaking, so staying silent is correct; a real interrupt drains via
+        # the generation bump the moment it is ruled. 6s = last-resort valve
+        # for a truly wedged flag (watchdog chains re-arm every 2.5s).
         waited = 0.0
-        while self._interrupt_pending and waited < 1.5:
+        while self._interrupt_pending and waited < 6.0:
             if generation != self._tts_generation:
                 return True
             await asyncio.sleep(0.05)
             waited += 0.05
-        # Still pending after the bound = the caller has been speaking for a
-        # while — treat as stale rather than talking over them (a backchannel
-        # ruling resolves in <½s, so this is almost certainly a real interrupt).
         return generation != self._tts_generation or self._interrupt_pending
 
     def _record_heard_text(self, text: str, secs: float = 0.0):

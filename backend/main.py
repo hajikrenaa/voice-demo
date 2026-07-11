@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import os
+import re
 import uvicorn
 import logging
 import logging.handlers
@@ -834,6 +835,32 @@ def _pop_stream_config(call_id: str | None) -> dict | None:
     return _pending_stream_configs.pop(str(call_id), None)
 
 
+def _normalize_phone_number(raw) -> str:
+    """Normalize a dialed number to E.164, defaulting to India (+91).
+
+    Live 2026-07-11 13:20: a 10-digit entry was dialed as '+7010873682' — a
+    Russia country prefix — instead of '+917010873682'. Indian mobiles are 10
+    digits starting 6-9; a bare '+' followed by exactly those 10 digits means
+    the 91 was lost, not that the caller is in Russia (Russian numbers have 11
+    digits after the +7).
+    """
+    if not raw:
+        return ""
+    digits = re.sub(r"[^\d+]", "", str(raw).strip())
+    if digits.startswith("+"):
+        rest = digits[1:].lstrip("+")
+        if len(rest) == 10 and rest[0] in "6789":
+            return "+91" + rest
+        return "+" + rest
+    if len(digits) == 10 and digits[0] in "6789":
+        return "+91" + digits
+    if len(digits) == 11 and digits.startswith("0") and digits[1] in "6789":
+        return "+91" + digits[1:]  # domestic trunk-0 format
+    if len(digits) == 12 and digits.startswith("91"):
+        return "+" + digits
+    return "+" + digits
+
+
 @app.post("/vobiz/voice")
 async def vobiz_voice_webhook(request: Request):
     """
@@ -912,7 +939,7 @@ async def make_outbound_call(request: Request):
         import httpx
 
         body = await request.json()
-        to_number = body.get("to")
+        to_number = _normalize_phone_number(body.get("to"))
         provider = _parse_provider(
             body.get("voice_provider") or body.get("provider"),
             body.get("elevenlabs", False),
