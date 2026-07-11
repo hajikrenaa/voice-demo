@@ -58,7 +58,7 @@ def run_tests():
 
     print("\nAll HTTP tests passed.")
 
-async def test_websocket():
+async def run_websocket_check():
     try:
         async with websockets.connect(f"{WS_URL}/ws/realtime") as ws:
             print("\n6. Testing WebSocket Realtime connection: OK")
@@ -68,4 +68,4 @@ async def test_websocket():
 
 if __name__ == "__main__":
     run_tests()
-    asyncio.run(test_websocket())
+    asyncio.run(run_websocket_check())

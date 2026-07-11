@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import os
 import uvicorn
 import logging
+import logging.handlers
 import sys
 import asyncio
 import json
@@ -12,6 +13,7 @@ import uuid
 import time
 import secrets
 import websockets
+from contextlib import asynccontextmanager
 from pathlib import Path
 from html import escape as html_escape
 
@@ -23,6 +25,7 @@ from services.conversation_manager import ConversationManager
 from services.realtime_service import RealtimeService, RealtimeEventHandler
 from services.vobiz_stream_service import VobizRealtimeHandler
 from services.test_call_bridge import run_test_call
+from services.prewarm_registry import PrewarmRegistry
 from utils.audio_processing import (
     decode_base64_audio,
     encode_audio_to_base64,
@@ -44,12 +47,29 @@ _TERMINAL_CALL_STATUSES = {
 }
 
 
+def _record_call_metrics(call_uuid: str, metrics: dict):
+    """Attach measured voice-agent metrics without changing call lifecycle status."""
+    if not call_uuid:
+        return
+    state = _call_states.setdefault(
+        call_uuid, {"status": "streaming", "duration": "", "ts": time.time()}
+    )
+    state["metrics"] = metrics
+    state["ts"] = time.time()
+
+
 def _record_call_state(call_uuid: str, status: str, duration: str = ""):
     """Record/update Vobiz call lifecycle state and prune expired entries."""
     if not call_uuid:
         return
     now = time.time()
-    _call_states[call_uuid] = {"status": status, "duration": duration, "ts": now}
+    previous = _call_states.get(call_uuid, {})
+    _call_states[call_uuid] = {
+        "status": status,
+        "duration": duration,
+        "ts": now,
+        **({"metrics": previous["metrics"]} if "metrics" in previous else {}),
+    }
     # Lightweight prune
     expired = [k for k, v in _call_states.items() if now - v.get("ts", 0) > _CALL_STATE_TTL]
     for k in expired:
@@ -138,21 +158,47 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# Configure logging
+# Configure logging. Console + rotating file: live-call bugs are diagnosed from
+# these logs after the fact, and console-only logging meant every restart threw
+# the evidence away (2026-07-11 — an interruption bug could not be traced
+# because no log survived the session). UTF-8 so Tamil transcripts land intact.
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_file_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(_LOG_DIR, "server.log"),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8",
+)
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(sys.stdout),
+        _file_handler,
     ]
 )
+# watchfiles logs "1 change detected" at INFO for every server.log write, which
+# itself lands in server.log — a self-sustaining spam loop (~3 lines/sec of
+# noise burying the call logs). It never triggers a reload (uvicorn only
+# reloads on *.py), so drop its chatter entirely.
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    yield
+    # Shutdown: close pre-warmed Realtime sockets so unanswered calls don't leak
+    # paid sessions. (Registry is defined later in the module; resolved at call time.)
+    await _prewarm_registry.close_all()
+
+
 app = FastAPI(
     title="AI Voice Agent",
     description="Professional AI voice agent with OpenAI integration",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # CORS middleware for browser access
@@ -207,6 +253,7 @@ async def health_check():
             "tts": "configured",
             "vobiz": "configured" if Config.VOBIZ_AUTH_ID else "not configured",
             "elevenlabs": "configured" if Config.ELEVENLABS_API_KEY else "not configured",
+            "sarvam": "configured" if Config.SARVAM_API_KEY else "not configured",
         },
         "environment": Config.ENVIRONMENT
     })
@@ -306,6 +353,9 @@ _EDITABLE_KEYS = [
     "ELEVENLABS_API_KEY",
     "ELEVENLABS_VOICE_ID",
     "ELEVENLABS_VOICE_ID_TA",
+    "SARVAM_API_KEY",
+    "SARVAM_SPEAKER",
+    "SARVAM_SPEAKER_TA",
     "VOBIZ_AUTH_ID",
     "VOBIZ_AUTH_TOKEN",
     "VOBIZ_PHONE_NUMBER",
@@ -380,7 +430,7 @@ async def get_settings(request: Request):
 
     env = _read_env()
     # Build response — mask secret keys, show others in full
-    secret_keys = {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "VOBIZ_AUTH_TOKEN", "LOGIN_PASSWORD"}
+    secret_keys = {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "SARVAM_API_KEY", "VOBIZ_AUTH_TOKEN", "LOGIN_PASSWORD"}
     settings = {}
     for key in _EDITABLE_KEYS:
         raw = env.get(key, "")
@@ -570,17 +620,14 @@ async def delete_script(script_id: str, request: Request):
 # Vobiz Voice Calling Endpoints
 # ==========================================
 
-# Pre-warmed OpenAI connection
-_prewarm_openai_task: asyncio.Task | None = None
-_prewarm_use_elevenlabs: bool = False
-# Language ("en" | "ta") the pre-warm + handler should use for the next call. Set right
-# before pre-warming (outbound-call / test-call / inbound voice webhook) so the
-# pre-warmed session carries the correct transcription language, voice and prompt.
-_prewarm_language: str = "en"
+# Each call owns a separate pre-warmed OpenAI connection. A single global task lets
+# concurrent calls steal one another's socket and prompt, so entries are keyed by a
+# random token passed through Vobiz's answer URL and stream extra headers.
+_prewarm_registry = PrewarmRegistry(ttl_seconds=Config.PREWARM_TTL_S)
 
 
-async def _prewarm_openai_connection(active_script: dict | None = None, use_elevenlabs: bool = False,
-                                     language: str = "en"):
+async def _prewarm_openai_connection(active_script: dict | None = None, tts_provider: str = "openai",
+                                     language: str = "en", called_number: str = ""):
     """Open an OpenAI Realtime WebSocket and pre-send session config.
 
     By sending session.update during the pre-warm (while Vobiz is still
@@ -607,17 +654,20 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
 
     try:
         temp_handler = VobizRealtimeHandler(
-            use_elevenlabs=use_elevenlabs, active_script=active_script, language=language
+            tts_provider=tts_provider, active_script=active_script, language=language,
+            called_number=called_number,
         )
+        # External TTS providers (elevenlabs/sarvam) run OpenAI in text-output mode.
+        external_tts = temp_handler.use_elevenlabs
         prompt = temp_handler._build_prompt()
-        max_tokens = 400 if active_script else 150
+        max_tokens = temp_handler._max_output_tokens()
 
-        output_modality = "text" if use_elevenlabs else "audio"
+        output_modality = "text" if external_tts else "audio"
         output_format_obj = (
-            {"type": "audio/pcm", "rate": 24000} if use_elevenlabs
+            {"type": "audio/pcm", "rate": 24000} if external_tts
             else {"type": "audio/pcmu"}
         )
-        vad_config = {"type": "semantic_vad", "eagerness": Config.SEMANTIC_VAD_EAGERNESS}
+        vad_config = temp_handler._preferred_turn_detection_config()
 
         session_config = {
             "type": "session.update",
@@ -638,11 +688,18 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
                     },
                 },
                 "max_output_tokens": max_tokens,
+                "truncation": {
+                    "type": "retention_ratio",
+                    "retention_ratio": Config.REALTIME_RETENTION_RATIO,
+                    "token_limits": {
+                        "post_instructions": Config.REALTIME_HISTORY_TOKEN_LIMIT,
+                    },
+                },
             },
         }
         await ws.send(json.dumps(session_config))
         logger.info(
-            f"Pre-sent session config during pre-warm (elevenlabs={use_elevenlabs}, "
+            f"Pre-sent session config during pre-warm (provider={tts_provider}, "
             f"language={language}, transcribe={temp_handler._transcription_config()['model']})"
         )
     except Exception as e:
@@ -656,6 +713,127 @@ async def _prewarm_openai_connection(active_script: dict | None = None, use_elev
     return ws
 
 
+def _start_prewarm(active_script: dict | None, tts_provider: str, language: str,
+                   called_number: str = "") -> str:
+    """Create one expiring pre-warm entry and return its opaque claim token."""
+    return _prewarm_registry.register(
+        lambda: _prewarm_openai_connection(
+            active_script, tts_provider, language, called_number
+        ),
+        use_elevenlabs=tts_provider != "openai",
+        tts_provider=tts_provider,
+        language=language,
+        active_script=active_script,
+        called_number=called_number,
+    )
+
+
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_provider(provider, elevenlabs_flag=None) -> str:
+    """Normalize a per-call TTS provider, honoring the legacy elevenlabs flag."""
+    provider = str(provider or "").strip().lower()
+    if provider in Config.TTS_PROVIDERS:
+        return provider
+    if elevenlabs_flag is not None and _parse_bool(elevenlabs_flag):
+        return "elevenlabs"
+    return "openai"
+
+
+def _parse_stream_extra_headers(message: dict) -> dict[str, str]:
+    """Parse Vobiz extra_headers in either mapping, JSON, or key=value form.
+
+    Checked in several locations because Vobiz's exact placement is not
+    documented: top-level `extra_headers`, plus camelCase and Twilio-style
+    `customParameters` variants inside the `start` object.
+    """
+    start_data = message.get("start") or {}
+    raw = ""
+    for source, key in (
+        (message, "extra_headers"),
+        (message, "extraHeaders"),
+        (start_data, "extra_headers"),
+        (start_data, "extraHeaders"),
+        (start_data, "custom_parameters"),
+        (start_data, "customParameters"),
+    ):
+        raw = source.get(key) if isinstance(source, dict) else None
+        if raw:
+            break
+    def _normalize_key(key: str) -> str:
+        # Vobiz prefixes each header with "X-VH-" (observed live 2026-07-10).
+        key = key.strip().strip("{}").strip()
+        if key.lower().startswith("x-vh-"):
+            key = key[5:]
+        return key
+
+    if isinstance(raw, dict):
+        return {_normalize_key(str(k)): str(v) for k, v in raw.items()}
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {_normalize_key(str(k)): str(v) for k, v in parsed.items()}
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Observed live format: "{X-VH-provider: sarvam, X-VH-language: ta, ...}"
+    # (braces, colon-separated, X-VH- prefixed). Also accept legacy "k=v,k2=v2".
+    result = {}
+    for pair in raw.strip().strip("{}").split(","):
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+        elif ":" in pair:
+            key, value = pair.split(":", 1)
+        else:
+            continue
+        key = _normalize_key(key)
+        if key:
+            result[key] = value.strip()
+    return result
+
+
+# ── Per-call config stash (Vobiz extraHeaders workaround) ──────────────────
+# Observed live 2026-07-09: Vobiz did NOT forward <Stream extraHeaders="...">
+# into the media-stream start event — extra_headers arrived empty, the prewarm
+# token/provider/language were lost, and a Sarvam+Tamil call fell back to
+# English+OpenAI. The dial/answer endpoints therefore stash each call's config
+# keyed by its CallUUID, and the stream start recovers it via start.callId.
+_pending_stream_configs: dict[str, dict] = {}
+_PENDING_STREAM_TTL_S = 300.0
+
+
+def _stash_stream_config(call_uuid: str, provider: str, language: str,
+                         prewarm_id: str, called_number: str = "") -> None:
+    if not call_uuid:
+        return
+    now = time.time()
+    # The answer webhook re-stashes the same call after the dial endpoint did —
+    # preserve the dial-time called_number instead of blanking it.
+    existing = _pending_stream_configs.get(str(call_uuid)) or {}
+    _pending_stream_configs[str(call_uuid)] = {
+        "provider": provider,
+        "language": language,
+        "prewarm_id": prewarm_id,
+        "called_number": called_number or existing.get("called_number", ""),
+        "ts": now,
+    }
+    stale = [k for k, v in _pending_stream_configs.items()
+             if now - v["ts"] > _PENDING_STREAM_TTL_S]
+    for k in stale:
+        _pending_stream_configs.pop(k, None)
+
+
+def _pop_stream_config(call_id: str | None) -> dict | None:
+    if not call_id:
+        return None
+    return _pending_stream_configs.pop(str(call_id), None)
+
+
 @app.post("/vobiz/voice")
 async def vobiz_voice_webhook(request: Request):
     """
@@ -665,14 +843,44 @@ async def vobiz_voice_webhook(request: Request):
     server_url = Config.SERVER_URL
     ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://")
 
-    use_elevenlabs_str = "true" if request.query_params.get("elevenlabs", "false").lower() == "true" else "false"
+    provider = _parse_provider(
+        request.query_params.get("provider"),
+        request.query_params.get("elevenlabs", "false"),
+    )
+    use_elevenlabs_str = "true" if provider == "elevenlabs" else "false"
 
     lang = request.query_params.get("lang", "en").lower()
     if lang not in Config.SUPPORTED_LANGUAGES:
         lang = "en"
 
-    # extraHeaders passes the elevenlabs flag + language to the WebSocket start event
-    extra_headers = f"elevenlabs={use_elevenlabs_str},language={lang}"
+    # Outbound calls arrive with their prewarm token. Inbound calls have no earlier
+    # dial request, so create a scoped pre-warm when the answer webhook fires.
+    prewarm_id = request.query_params.get("prewarm", "").strip()
+    if not _prewarm_registry.contains(prewarm_id):
+        prewarm_id = _start_prewarm(_active_script, provider, lang)
+
+    # Stash config by CallUUID so the stream start can recover it even when
+    # Vobiz drops the Stream extraHeaders (observed live — see stash helpers).
+    try:
+        form = await request.form()
+        call_uuid = str(
+            form.get("CallUUID") or form.get("call_uuid")
+            or form.get("request_uuid") or ""
+        ).strip()
+    except Exception:
+        call_uuid = ""
+    _stash_stream_config(call_uuid, provider, lang, prewarm_id)
+    logger.info(
+        f"Vobiz voice webhook: call={call_uuid or '?'} provider={provider} "
+        f"lang={lang} prewarm={prewarm_id[:8]}..."
+    )
+
+    # Pass the exact call's mode/language/prewarm token into the stream start event.
+    # The legacy elevenlabs flag is kept alongside `provider` for compatibility.
+    extra_headers = (
+        f"provider={provider},elevenlabs={use_elevenlabs_str},"
+        f"language={lang},prewarm_id={prewarm_id}"
+    )
 
     vobiz_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -686,15 +894,6 @@ async def vobiz_voice_webhook(request: Request):
     <Speak>Sorry, the voice agent disconnected. Please try calling again.</Speak>
 </Response>"""
 
-    # Pre-warm: only start if not already running (outbound-call starts it earlier).
-    # For inbound calls (no prior outbound-call), seed the pre-warm language from ?lang.
-    global _prewarm_openai_task, _prewarm_language
-    if not _prewarm_openai_task:
-        elevenlabs_flag = use_elevenlabs_str == "true"
-        _prewarm_language = lang
-        _prewarm_openai_task = asyncio.create_task(
-            _prewarm_openai_connection(_active_script, elevenlabs_flag, lang)
-        )
 
     logger.info(f"Vobiz voice webhook called, script_active={_active_script is not None}")
     return Response(content=vobiz_xml, media_type="application/xml")
@@ -708,12 +907,16 @@ async def make_outbound_call(request: Request):
     """
     if not _require_auth(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    prewarm_id = None
     try:
         import httpx
 
         body = await request.json()
         to_number = body.get("to")
-        use_elevenlabs = body.get("elevenlabs", False)
+        provider = _parse_provider(
+            body.get("voice_provider") or body.get("provider"),
+            body.get("elevenlabs", False),
+        )
         language = str(body.get("language", "en")).lower()
         if language not in Config.SUPPORTED_LANGUAGES:
             language = "en"
@@ -734,16 +937,17 @@ async def make_outbound_call(request: Request):
             logger.error(msg)
             return JSONResponse({"error": msg}, status_code=503)
 
-        # Pre-warm OpenAI connection NOW (while Vobiz dials + phone rings)
-        global _prewarm_openai_task, _prewarm_use_elevenlabs, _prewarm_language
-        _prewarm_use_elevenlabs = bool(use_elevenlabs)
-        _prewarm_language = language
-        _prewarm_openai_task = asyncio.create_task(
-            _prewarm_openai_connection(_active_script, use_elevenlabs, language)
+        # Pre-warm OpenAI while Vobiz dials. The random token prevents concurrent
+        # calls from claiming one another's socket or language/prompt configuration.
+        prewarm_id = _start_prewarm(
+            _active_script, provider, language, called_number=to_number
         )
 
-        el = 'true' if use_elevenlabs else 'false'
-        answer_url = f"{Config.SERVER_URL}/vobiz/voice?elevenlabs={el}&lang={language}"
+        el = 'true' if provider == "elevenlabs" else 'false'
+        answer_url = (
+            f"{Config.SERVER_URL}/vobiz/voice?provider={provider}&elevenlabs={el}"
+            f"&lang={language}&prewarm={prewarm_id}"
+        )
         hangup_url = f"{Config.SERVER_URL}/vobiz/call-status"
 
         payload = {
@@ -765,11 +969,17 @@ async def make_outbound_call(request: Request):
             resp = await client.post(api_url, json=payload, headers=headers, timeout=15.0)
 
         if resp.status_code not in (200, 201):
+            await _prewarm_registry.discard(prewarm_id)
             logger.error(f"Vobiz outbound call failed: {resp.status_code} {resp.text}")
             return JSONResponse({"error": resp.text}, status_code=resp.status_code)
 
         data = resp.json()
         call_uuid = data.get("request_uuid") or data.get("api_id", "")
+        # Second stash layer for outbound calls: the dial response's UUID matches
+        # the stream start's callId, so config survives even if the answer
+        # webhook's form omits CallUUID.
+        _stash_stream_config(call_uuid, provider, language, prewarm_id,
+                             called_number=to_number)
         logger.info(f"Outbound call initiated: {call_uuid} to {to_number}")
         _record_call_state(call_uuid, "initiated")
 
@@ -781,6 +991,7 @@ async def make_outbound_call(request: Request):
         })
 
     except Exception as e:
+        await _prewarm_registry.discard(prewarm_id)
         logger.error(f"Failed to make outbound call: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -841,25 +1052,7 @@ async def vobiz_media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Vobiz media stream WebSocket connected and accepted")
 
-    if _active_script:
-        logger.info(
-            f"Creating handler WITH script: {_active_script.get('name', 'unnamed')} "
-            f"({len(_active_script.get('questions', []))} questions)"
-        )
-    else:
-        logger.info("Creating handler WITHOUT script — using default prompt")
-    handler = VobizRealtimeHandler(
-        use_elevenlabs=_prewarm_use_elevenlabs,
-        active_script=_active_script,
-        language=_prewarm_language,
-    )
-
-    # Pass pre-warmed OpenAI connection if available
-    global _prewarm_openai_task
-    if _prewarm_openai_task:
-        handler._prewarm_task = _prewarm_openai_task
-        handler._session_preconfigured = True
-        _prewarm_openai_task = None
+    handler = None
 
     try:
         async for raw_message in websocket.iter_text():
@@ -868,6 +1061,62 @@ async def vobiz_media_stream(websocket: WebSocket):
                 event = message.get("event")
                 if event != "media":
                     logger.info(f"Vobiz stream event: {event}")
+
+                if event == "start" and handler is None:
+                    # Diagnostic: Vobiz's extraHeaders placement is undocumented and
+                    # was observed missing on live calls — log the raw start payload
+                    # so the actual shape is visible in the logs.
+                    logger.info(
+                        "Vobiz start payload: %s", json.dumps(message)[:600]
+                    )
+                    headers = _parse_stream_extra_headers(message)
+                    if not headers.get("prewarm_id"):
+                        # Vobiz dropped the extraHeaders — recover this call's
+                        # provider/language/prewarm via its CallUUID stash.
+                        start_data = message.get("start", {}) or {}
+                        call_id = start_data.get("callId") or message.get("callId")
+                        pending = _pop_stream_config(call_id)
+                        if pending:
+                            headers.setdefault("provider", pending["provider"])
+                            headers.setdefault("language", pending["language"])
+                            headers.setdefault(
+                                "called_number", pending.get("called_number", "")
+                            )
+                            headers["prewarm_id"] = pending["prewarm_id"]
+                            logger.info(
+                                "Recovered call config via callId=%s "
+                                "(extraHeaders missing): provider=%s language=%s",
+                                call_id, pending["provider"], pending["language"],
+                            )
+                    entry = _prewarm_registry.claim(headers.get("prewarm_id"))
+                    if entry:
+                        handler = VobizRealtimeHandler(
+                            tts_provider=entry.tts_provider,
+                            active_script=entry.active_script,
+                            language=entry.language,
+                            called_number=entry.called_number,
+                        )
+                        handler._prewarm_task = entry.task
+                        handler._session_preconfigured = True
+                        logger.info("Claimed call-scoped Realtime pre-warm")
+                    else:
+                        provider = _parse_provider(
+                            headers.get("provider"), headers.get("elevenlabs", "false")
+                        )
+                        language = headers.get("language", "en").lower()
+                        if language not in Config.SUPPORTED_LANGUAGES:
+                            language = "en"
+                        handler = VobizRealtimeHandler(
+                            tts_provider=provider,
+                            active_script=_active_script,
+                            language=language,
+                            called_number=headers.get("called_number", ""),
+                        )
+                        logger.info("No matching pre-warm; using a cold Realtime connection")
+
+                if handler is None:
+                    logger.warning("Ignoring Vobiz event before stream start: %s", event)
+                    continue
                 await handler.handle_vobiz_message(websocket, message)
             except json.JSONDecodeError:
                 logger.error("Failed to parse Vobiz stream message")
@@ -879,8 +1128,10 @@ async def vobiz_media_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Vobiz stream WebSocket error: {e}")
     finally:
-        await handler._full_cleanup()
-        logger.info(f"Vobiz stream closed — callId: {handler.call_id}")
+        if handler:
+            await handler._full_cleanup()
+            _record_call_metrics(handler.call_id, handler.get_metrics())
+            logger.info(f"Vobiz stream closed — callId: {handler.call_id}")
 
 
 @app.get("/ws/vobiz-stream")
@@ -910,28 +1161,24 @@ async def test_call_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Test call WS connected (no Vobiz credits will be used)")
 
-    # Pre-warm OpenAI connection for latency parity with real calls.
-    global _prewarm_openai_task, _prewarm_use_elevenlabs, _prewarm_language
-    use_elevenlabs = websocket.query_params.get("elevenlabs", "false").lower() == "true"
+    # Test calls get their own local pre-warm and never share state with live calls.
+    provider = _parse_provider(
+        websocket.query_params.get("provider"),
+        websocket.query_params.get("elevenlabs", "false"),
+    )
     language = websocket.query_params.get("language", "en").lower()
     if language not in Config.SUPPORTED_LANGUAGES:
         language = "en"
-    if not _prewarm_openai_task:
-        _prewarm_use_elevenlabs = use_elevenlabs
-        _prewarm_language = language
-        _prewarm_openai_task = asyncio.create_task(
-            _prewarm_openai_connection(_active_script, use_elevenlabs, language)
-        )
-    prewarm_task = _prewarm_openai_task
-    prewarm_flag = _prewarm_use_elevenlabs
-    _prewarm_openai_task = None
+    prewarm_task = asyncio.create_task(
+        _prewarm_openai_connection(_active_script, provider, language)
+    )
 
     try:
         await run_test_call(
             browser_ws=websocket,
             active_script=_active_script,
             prewarm_task=prewarm_task,
-            prewarm_use_elevenlabs=prewarm_flag,
+            prewarm_tts_provider=provider,
             language=language,
         )
     except WebSocketDisconnect:
@@ -971,6 +1218,7 @@ async def get_call_state(call_uuid: str):
         "status": status_lower,
         "duration": state.get("duration", ""),
         "ended": ended,
+        "metrics": state.get("metrics"),
     })
 
 
@@ -990,10 +1238,12 @@ async def vobiz_status():
     """Check Vobiz configuration status."""
     has_vobiz = bool(Config.VOBIZ_AUTH_ID and Config.VOBIZ_AUTH_TOKEN)
     has_elevenlabs = bool(Config.ELEVENLABS_API_KEY)
+    has_sarvam = bool(Config.SARVAM_API_KEY)
 
     return JSONResponse({
         "vobiz_configured": has_vobiz,
         "elevenlabs_configured": has_elevenlabs,
+        "sarvam_configured": has_sarvam,
         "vobiz_phone": Config.VOBIZ_PHONE_NUMBER if has_vobiz else None,
         "server_url": Config.SERVER_URL,
         "answer_url": f"{Config.SERVER_URL}/vobiz/voice",
@@ -1395,6 +1645,9 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=Config.is_development(),
+        # Auto-reload is permanently OFF: a watchfiles reload fired mid-call
+        # (2026-07-11 06:07, English call) and killed the live Vobiz stream.
+        # It also loads half-edited code states. Restart manually after edits.
+        reload=False,
         log_level=Config.LOG_LEVEL.lower()
     )

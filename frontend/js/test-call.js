@@ -4,7 +4,7 @@
  *
  * Flow:
  *   1. Open /ws/test-call?token=... (session token from localStorage).
- *   2. Send {type:"start", elevenlabs}.
+ *   2. Send {type:"start", provider} ("openai" | "elevenlabs" | "sarvam").
  *   3. Capture mic as PCM16 24 kHz and stream via {type:"audio_chunk"}.
  *   4. Play PCM16 24 kHz from {type:"response_audio"}.
  *   5. Render transcripts live, handle clear_audio (interruption barge-in).
@@ -16,7 +16,10 @@ class TestCallClient {
         this.recorder = null;
         this.player = null;
         this.isActive = false;
-        this.useElevenLabs = !!options.elevenlabs;
+        const provider = options.provider
+            || (options.elevenlabs ? 'elevenlabs' : 'openai');
+        this.provider = ['openai', 'elevenlabs', 'sarvam'].includes(provider)
+            ? provider : 'openai';
         this.language = options.language === 'ta' ? 'ta' : 'en';
 
         // UI callbacks
@@ -51,6 +54,9 @@ class TestCallClient {
         } catch (e) {
             this.onError(e);
             this._teardown();
+            // Reset the panel (Start button back) — without this a denied mic
+            // permission left a dead "End Test Call" button until page reload.
+            this.onEnded();
             return;
         }
 
@@ -63,10 +69,9 @@ class TestCallClient {
 
         // Open WS
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const el = this.useElevenLabs ? 'true' : 'false';
         const url = `${proto}//${location.host}/ws/test-call`
             + `?token=${encodeURIComponent(token)}`
-            + `&elevenlabs=${el}`
+            + `&provider=${encodeURIComponent(this.provider)}`
             + `&language=${encodeURIComponent(this.language)}`;
 
         this.onStatus('connecting', 'Connecting…');
@@ -76,6 +81,7 @@ class TestCallClient {
         } catch (e) {
             this.onError(e);
             this._teardown();
+            this.onEnded();
             return;
         }
 
@@ -83,7 +89,7 @@ class TestCallClient {
             // Send start, then begin streaming mic
             this.ws.send(JSON.stringify({
                 type: 'start',
-                elevenlabs: this.useElevenLabs,
+                provider: this.provider,
                 language: this.language,
             }));
             this.isActive = true;
@@ -105,17 +111,22 @@ class TestCallClient {
         };
 
         this.ws.onclose = () => {
-            if (this.isActive) {
-                this.onStatus('ended', 'Call ended');
-                this.isActive = false;
-                this._teardown();
-                this.onEnded();
-            }
+            // Fire teardown even if the socket never reached "active" (e.g. the
+            // server rejected the connection) so the panel resets to Start.
+            const wasActive = this.isActive;
+            this.isActive = false;
+            this._teardown();
+            if (wasActive) this.onStatus('ended', 'Call ended');
+            this.onEnded();
         };
     }
 
     async stop() {
-        if (!this.isActive && !this.ws) return;
+        if (!this.isActive && !this.ws) {
+            // Nothing to tear down, but still reset the panel UI.
+            this.onEnded();
+            return;
+        }
         this.isActive = false;
         try {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {

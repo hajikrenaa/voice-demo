@@ -2,6 +2,8 @@
 
 A professional web-based AI voice agent with human-like speech, >90% accuracy, and low latency. Built with Python (FastAPI) backend and vanilla JavaScript frontend, powered entirely by OpenAI APIs (Whisper, GPT-4o, TTS).
 
+Production latency, stability, and cost settings: see [VOICE_PRODUCTION.md](VOICE_PRODUCTION.md).
+
 ## Features
 
 - **Real-time Voice Conversation**: Speak naturally with AI using your microphone
@@ -21,9 +23,14 @@ as English. It's a **per-call** choice — pick it from the **Language** dropdow
 selector bar before starting a call. English calls are completely unchanged.
 
 How it works:
-- **Both voice engines work in Tamil**, selected per call with the existing ElevenLabs toggle:
-  - *OpenAI native* (toggle off): lowest latency speech-to-speech in Tamil.
-  - *ElevenLabs* (toggle on): a native Tamil voice (default **Meera**) — best pronunciation.
+- **All three voice engines work in Tamil**, selected per call with the **Voice** dropdown:
+  - *OpenAI (built-in)*: lowest latency speech-to-speech in Tamil.
+  - *ElevenLabs*: a native Tamil voice (default **Meera**) — best pronunciation.
+  - *Sarvam AI*: Indian-language-first TTS (bulbul:v3, default speaker **ishita** —
+    Sarvam's recommended Tamil voice), streamed over Sarvam's WebSocket API with
+    native mulaw/8kHz output (~350ms to first audio on a warm, pre-warmed
+    connection). TTS only; STT/LLM stay on OpenAI. ~3x cheaper than ElevenLabs
+    per spoken minute (₹2.6/min vs ₹8+/min); bulbul:v2 halves that again.
 - The agent speaks **natural colloquial Tamil with Tanglish** (keeps English numbers/brand
   terms), uses the Indian number system, and confirms English names/emails with English
   letters ("at the rate", "dot") — tuned for real Tamil phone callers.
@@ -36,6 +43,9 @@ Configuration (all optional — sensible defaults are baked in; see `.env.exampl
   `marin`/`cedar`).
 - `TRANSCRIPTION_MODEL_TA` — defaults to `whisper-1` (guaranteed compatible). For better
   Tamil accuracy, set `gpt-4o-transcribe` after a test call confirms it connects.
+- `SARVAM_API_KEY` — required for the Sarvam AI voice option.
+- `SARVAM_SPEAKER` / `SARVAM_SPEAKER_TA` — Sarvam bulbul:v2 speaker per language
+  (default `anushka`; also: manisha, vidya, arya, abhilash, karun, hitesh).
 
 Known v1 limitation: the English "I'm busy / call me later" early-exit phrase list is not
 yet translated, so that specific shortcut won't trigger on Tamil phrasing — the normal

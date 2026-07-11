@@ -70,6 +70,40 @@ class Config:
     TTS_BYTES_PER_CHAR_TA = int(os.getenv("TTS_BYTES_PER_CHAR_TA", "2000"))
     TTS_ANOMALY_RETRIES = int(os.getenv("TTS_ANOMALY_RETRIES", "2"))
 
+    # ── Sarvam AI Configuration (3rd voice option) ──────────
+    # Sarvam is TTS-ONLY: STT + LLM stay on OpenAI Realtime (text-output mode),
+    # exactly like the ElevenLabs path. Primary transport is Sarvam's WebSocket
+    # streaming API with native mulaw/8000 output (~300-420ms to first audio,
+    # measured 2026-07-09); REST is a per-utterance fallback only, because REST
+    # latency swung 0.6s-14s+ under load on the same account.
+    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+    # bulbul:v3 over WS streaming was as fast as v2 (first chunk ~300-390ms) and is
+    # the model Sarvam's docs recommend for Tamil. Costs 2x v2 (Rs30 vs Rs15 per 10K
+    # chars) — set SARVAM_TTS_MODEL=bulbul:v2 + a v2 speaker (anushka/vidya/...) to
+    # halve Sarvam cost at some Tamil-quality loss. Speaker sets are DISJOINT per
+    # model: v2 = anushka, manisha, vidya, arya, abhilash, karun, hitesh;
+    # v3 = ishita, ritu, priya, ratan, rohan, kavitha, + ~30 more.
+    SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
+    # "ishita" is Sarvam's documented female pick for Tamil (0.13% error rate in
+    # their speaker eval; "ritu" is the alternate, "ratan"/"rohan" the male picks).
+    SARVAM_SPEAKER = os.getenv("SARVAM_SPEAKER", "ishita")
+    SARVAM_SPEAKER_TA = os.getenv("SARVAM_SPEAKER_TA", "ishita")
+    # bulbul:v3 delivery tuning (Sarvam docs: start pace=1.0/temp=0.6, tune one
+    # at a time; higher temp = more expressive but more artifacts). 0.5 trades a
+    # little playground expressiveness — mostly lost on an 8kHz line anyway —
+    # for consistency across hundreds of utterances.
+    SARVAM_TTS_PACE = float(os.getenv("SARVAM_TTS_PACE", "1.0"))
+    SARVAM_TTS_TEMPERATURE = float(os.getenv("SARVAM_TTS_TEMPERATURE", "0.5"))
+    # WS buffering: synthesis starts once the text buffer reaches min_buffer_size
+    # chars (we always flush whole sentences, so 30 = start the instant a
+    # sentence lands instead of waiting for the flush frame to parse).
+    SARVAM_MIN_BUFFER_SIZE = int(os.getenv("SARVAM_MIN_BUFFER_SIZE", "30"))
+    SARVAM_MAX_CHUNK_LENGTH = int(os.getenv("SARVAM_MAX_CHUNK_LENGTH", "150"))
+
+    # Valid per-call TTS providers. "openai" = native Realtime speech-to-speech;
+    # "elevenlabs"/"sarvam" = Realtime text output + external TTS.
+    TTS_PROVIDERS = {"openai", "elevenlabs", "sarvam"}
+
     # Login Credentials (single user)
     LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin")
     LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "admin123")
@@ -108,7 +142,7 @@ class Config:
     TTS_SPEED = 1.0  # 0.25 to 4.0
 
     # OpenAI Realtime API Configuration (for ultra-low latency)
-    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime")
+    REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime-mini")
     REALTIME_VOICE = os.getenv("REALTIME_VOICE", "coral")  # English native voice
     # Native (speech-to-speech) voice for Tamil calls. OpenAI has no officially
     # benchmarked "best Tamil voice"; the newest GA voices (marin/cedar) tend to have
@@ -127,12 +161,29 @@ class Config:
     # (proven). Tamil also defaults to whisper-1 for guaranteed compatibility; for
     # materially better Tamil accuracy set TRANSCRIPTION_MODEL_TA=gpt-4o-transcribe
     # (accepted by the GA Realtime transcription field) after a test call confirms it.
-    TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "whisper-1")
+    TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
     # gpt-4o-transcribe is markedly more accurate for Tamil than whisper-1 (which
     # garbles names and code-mixed speech over 8kHz). Accepted by the GA Realtime
     # transcription field. If a Tamil call ever fails to connect, set this back to
     # whisper-1 via the TRANSCRIPTION_MODEL_TA env var.
     TRANSCRIPTION_MODEL_TA = os.getenv("TRANSCRIPTION_MODEL_TA", "gpt-4o-transcribe")
+    # Tamil-call transcription language pin. Live call 2026-07-10 proved that
+    # pinning language="ta" forces Tamil-script output for EVERYTHING — English
+    # speech and spelled names ("first name H-A-J-I-K") became Tamil gibberish
+    # ("பஸ்கேனன் லாஸ்னேமே..."), and the model hallucinated names/answers from it.
+    # Default is EMPTY = auto-detect, which handles Tanglish code-mixing; set
+    # TRANSCRIPTION_LANGUAGE_TA=ta only if a call is guaranteed pure Tamil.
+    TRANSCRIPTION_LANGUAGE_TA = os.getenv("TRANSCRIPTION_LANGUAGE_TA", "").strip()
+    # Bias prompt for Tamil-call transcription (supported by gpt-4o-transcribe
+    # and whisper): tells the transcriber to expect Tanglish and to keep names,
+    # emails and spelled letters in English script.
+    TRANSCRIPTION_PROMPT_TA = os.getenv(
+        "TRANSCRIPTION_PROMPT_TA",
+        "Tanglish phone call from India: the speaker mixes spoken Tamil and "
+        "English mid-sentence. Transcribe Tamil speech in Tamil script. Keep "
+        "English words, names, emails, numbers and spelled-out letters "
+        "(example: H-A-J-I-K) in English letters exactly as spoken.",
+    )
 
     # Vobiz Audio Settings (mulaw 8kHz — zero-conversion)
     VOBIZ_SAMPLE_RATE = 8000  # Vobiz supports audio/x-mulaw;rate=8000
@@ -140,8 +191,8 @@ class Config:
 
     # ── Human-Like Conversation Tuning ──────────────────────
     # Smart interruption handling
-    INTERRUPTION_EVAL_DELAY_MS = int(os.getenv("INTERRUPTION_EVAL_DELAY_MS", "300"))
-    BACKCHANNEL_MAX_DURATION_MS = int(os.getenv("BACKCHANNEL_MAX_DURATION_MS", "500"))
+    INTERRUPTION_EVAL_DELAY_MS = int(os.getenv("INTERRUPTION_EVAL_DELAY_MS", "250"))
+    BACKCHANNEL_MAX_DURATION_MS = int(os.getenv("BACKCHANNEL_MAX_DURATION_MS", "250"))
     GENTLE_CLEAR_DELAY_MS = int(os.getenv("GENTLE_CLEAR_DELAY_MS", "30"))
 
     # After the agent says goodbye, how long to wait before hanging up once we've
@@ -162,16 +213,40 @@ class Config:
     ECHO_GATE_RMS_HARD = int(os.getenv("ECHO_GATE_RMS_HARD", "600"))
     ECHO_GATE_RMS_SOFT = int(os.getenv("ECHO_GATE_RMS_SOFT", "1000"))
     ECHO_COOLDOWN_S = float(os.getenv("ECHO_COOLDOWN_S", "0.15"))  # was 0.3s
+    # Approximate carrier/network buffering before the first outbound byte is heard.
+    # Subtracted when synchronizing an interrupted assistant item with OpenAI.
+    VOBIZ_PLAYBACK_LAG_MS = int(os.getenv("VOBIZ_PLAYBACK_LAG_MS", "80"))
 
     # VAD tuning for Realtime API — aggressive settings for minimum latency
-    VAD_TYPE = os.getenv("VAD_TYPE", "semantic_vad")
+    VAD_TYPE = os.getenv("VAD_TYPE", "server_vad")
     VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.4"))       # Lower = triggers sooner
-    VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "50"))    # was 150ms
-    VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "100"))  # was 200ms
+    VAD_PREFIX_PADDING_MS = int(os.getenv("VAD_PREFIX_PADDING_MS", "120"))
+    VAD_SILENCE_DURATION_MS = int(os.getenv("VAD_SILENCE_DURATION_MS", "200"))
     SEMANTIC_VAD_EAGERNESS = os.getenv("SEMANTIC_VAD_EAGERNESS", "high")
+    # Make Realtime turn behavior explicit instead of relying on API defaults.
+    # Automatic response creation keeps latency low. Automatic interruption is
+    # disabled because the bridge applies a short backchannel test before cancelling,
+    # so a quick "mm-hm" does not cut the agent off.
+    VAD_CREATE_RESPONSE = os.getenv("VAD_CREATE_RESPONSE", "true").lower() == "true"
+    VAD_INTERRUPT_RESPONSE = os.getenv("VAD_INTERRUPT_RESPONSE", "false").lower() == "true"
+
+    # If the upstream Realtime socket dies, end the media stream promptly so Vobiz
+    # can execute the fallback XML instead of leaving the caller in dead air.
+    CLOSE_CALL_ON_REALTIME_DISCONNECT = (
+        os.getenv("CLOSE_CALL_ON_REALTIME_DISCONNECT", "true").lower() == "true"
+    )
+    # An unanswered outbound call must not keep a paid Realtime socket alive forever.
+    # 75 seconds covers normal ringing while bounding abandoned pre-warm cost.
+    PREWARM_TTL_S = float(os.getenv("PREWARM_TTL_S", "75"))
+
+    # Bound per-turn history cost on long calls. OpenAI recommends a retention ratio
+    # below 1 so truncation happens less frequently and prompt caching remains useful.
+    REALTIME_HISTORY_TOKEN_LIMIT = int(os.getenv("REALTIME_HISTORY_TOKEN_LIMIT", "8000"))
+    REALTIME_RETENTION_RATIO = float(os.getenv("REALTIME_RETENTION_RATIO", "0.8"))
 
     # System Prompt (structured for mini model — explicit priority rules)
     SYSTEM_PROMPT = """Real person on a phone call. Warm, concise, English only. 1-2 sentences max.
+At the very start of a call, say exactly: "Hello! How can I help you today?"
 PRIORITY RULES:
 1. Always answer the caller's questions first. Never ignore what they ask.
 2. If caller says audio is bad or asks to repeat — apologize and repeat. Do NOT proceed.
@@ -182,12 +257,20 @@ Confirm names, forget old if corrected. Ask to repeat if unclear."""
     # Tamil default prompt (used when no script is active and language=ta). Written in
     # natural spoken Tamil per OpenAI's guidance that an in-language lock reduces the
     # model's tendency to drift back to English on names/numbers/short turns.
-    SYSTEM_PROMPT_TA = """நீங்க ஃபோன் கால்ல பேசுற ஒரு உண்மையான நபர். எப்பவும் இயல்பான, அன்றாட பேச்சுத் தமிழ்ல மட்டுமே பேசுங்க — செந்தமிழ் / எழுத்துத் தமிழ் / கவிதை நடை வேண்டாம். ஒரு தடவைக்கு 1-2 சின்ன வாக்கியம் மட்டும்.
+    # Register (user requirement 2026-07-09): a MATURED native Tamilian speaking
+    # natural Tanglish — everyday English words (appointment, confirm, details...)
+    # stay in English inside Tamil sentences, the way a real Tamil professional
+    # talks on the phone. Calm and composed, never bookish, never fully English.
+    SYSTEM_PROMPT_TA = """நீங்க ஃபோன் கால்ல பேசுற ஒரு உண்மையான நபர் — நிதானமான, அனுபவமுள்ள (matured) native Tamil பேசுறவர் மாதிரி பேசுங்க. ஒரு தடவைக்கு 1-2 சின்ன வாக்கியம் மட்டும்.
+பேச்சு style — ரொம்ப முக்கியம்:
+- இயல்பான பேச்சுத் தமிழ் + Tanglish. Tamil பேசுறவங்க daily-ஆ English-ல சொல்ற வார்த்தைகளை (appointment, confirm, details, address, email, time, morning, ok, sorry) அப்படியே English-லயே சொல்லுங்க — கஷ்டப்பட்டு தமிழ்ல மொழிபெயர்க்காதீங்க ('மின்னஞ்சல்' இல்ல 'email'; 'உறுதி செய்யறேன்' இல்ல 'confirm பண்றேன்').
+- செந்தமிழ் / எழுத்துத் தமிழ் / கவிதை நடை வேண்டவே வேண்டாம். Over-excitement வேண்டாம் — அமைதியா, நம்பிக்கையா, மரியாதையா பேசுங்க.
+- ஆனா முழு வாக்கியத்தையும் English-ல பேசாதீங்க — வாக்கியத்தோட ஓட்டம் எப்பவும் தமிழ்தான்; English வார்த்தைகள் அதுக்குள்ள இயல்பா வரட்டும்.
 முக்கிய விதிகள்:
 1. அழைப்பவர் கேட்கிற கேள்விக்கு முதல்ல பதில் சொல்லுங்க. அவங்க சொல்றதை புறக்கணிக்காதீங்க.
-2. ஆடியோ சரியில்லைனு சொன்னா, அல்லது மறுபடி சொல்லச் சொன்னா — மன்னிப்பு கேட்டு மறுபடி சொல்லுங்க.
-3. பெயர், எண், மின்னஞ்சல் எதையும் யூகிக்காதீங்க — அழைப்பவர் சொன்னதை மட்டும் பயன்படுத்துங்க.
-ஆங்கில எண்கள், பெயர்கள், 'ok / sorry / thank you' மாதிரி சில வார்த்தைகளை அழைப்பவர் பயன்படுத்தினாலும், நீங்க முழுசா ஆங்கிலத்துக்கு மாறாம தமிழ்லயே தொடருங்க. 'நீங்க'ன்னு மரியாதையா கூப்பிடுங்க."""
+2. ஆடியோ சரியில்லைனு சொன்னா, அல்லது repeat பண்ணச் சொன்னா — sorry சொல்லி மறுபடி சொல்லுங்க.
+3. பெயர், எண், email எதையும் யூகிக்காதீங்க — அழைப்பவர் சொன்னதை மட்டும் பயன்படுத்துங்க.
+'நீங்க'ன்னு மரியாதையா கூப்பிடுங்க ('நீ' வேண்டாம்); '-ங்க' சேர்த்து பேசுங்க (சொல்லுங்க, வாங்க)."""
 
     @classmethod
     def validate(cls):

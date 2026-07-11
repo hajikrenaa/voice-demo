@@ -171,7 +171,7 @@
             <div class="dialer-panel" id="dialerPanel">
                 <div class="dialer-header">
                     <h2>Phone Dialer</h2>
-                    <span class="dialer-subtitle">Call via Twilio AI Agent</span>
+                    <span class="dialer-subtitle">Call via Vobiz AI Agent</span>
                 </div>
                 <div class="dialer-input-row">
                     <input type="tel" id="phoneInput" class="phone-input" placeholder="+1 (555) 123-4567" />
@@ -185,14 +185,13 @@
                     </button>
                 </div>
                 <div class="dialer-options">
-                    <label class="toggle-label" for="toggleElevenLabs">
-                        <span class="toggle-switch">
-                            <input type="checkbox" id="toggleElevenLabs" />
-                            <span class="toggle-slider"></span>
-                        </span>
-                        <span class="toggle-text">ElevenLabs Voice</span>
-                        <span class="toggle-hint" id="voiceHint">(Using OpenAI built-in voice)</span>
-                    </label>
+                    <label for="voiceProviderSelect" class="model-selector-label">Voice</label>
+                    <select id="voiceProviderSelect" class="model-select">
+                        <option value="openai" selected>OpenAI (built-in)</option>
+                        <option value="elevenlabs">ElevenLabs</option>
+                        <option value="sarvam">Sarvam AI</option>
+                    </select>
+                    <span class="toggle-hint" id="voiceHint">(Using OpenAI built-in voice)</span>
                 </div>
                 <div class="call-status hidden" id="callStatus">
                     <div class="call-status-dot"></div>
@@ -243,14 +242,13 @@
                     </div>
 
                     <div class="test-call-options">
-                        <label class="toggle-label" for="testToggleElevenLabs">
-                            <span class="toggle-switch">
-                                <input type="checkbox" id="testToggleElevenLabs" />
-                                <span class="toggle-slider"></span>
-                            </span>
-                            <span class="toggle-text">ElevenLabs Voice</span>
-                            <span class="toggle-hint" id="testVoiceHint">(Using OpenAI built-in voice)</span>
-                        </label>
+                        <label for="testVoiceProviderSelect" class="model-selector-label">Voice</label>
+                        <select id="testVoiceProviderSelect" class="model-select">
+                            <option value="openai" selected>OpenAI (built-in)</option>
+                            <option value="elevenlabs">ElevenLabs</option>
+                            <option value="sarvam">Sarvam AI</option>
+                        </select>
+                        <span class="toggle-hint" id="testVoiceHint">(Using OpenAI built-in voice)</span>
                     </div>
 
                     <div class="test-call-controls">
@@ -353,23 +351,43 @@
                         </div>
                     </div>
 
-                    <!-- Twilio -->
+                    <!-- Sarvam AI -->
                     <div class="api-settings-group">
-                        <h4>Twilio</h4>
+                        <h4>Sarvam AI</h4>
                         <div class="api-setting-item">
-                            <label for="settingTwilioSid">Account SID</label>
-                            <input type="text" id="settingTwilioSid" data-key="TWILIO_ACCOUNT_SID" placeholder="AC..." class="api-key-input" />
-                        </div>
-                        <div class="api-setting-item">
-                            <label for="settingTwilioToken">Auth Token</label>
+                            <label for="settingSarvamKey">API Key</label>
                             <div class="api-input-row">
-                                <input type="password" id="settingTwilioToken" data-key="TWILIO_AUTH_TOKEN" placeholder="Auth token" class="api-key-input" />
+                                <input type="password" id="settingSarvamKey" data-key="SARVAM_API_KEY" placeholder="sk_..." class="api-key-input" />
                                 <button class="btn-toggle-vis" title="Show/Hide" onclick="toggleKeyVisibility(this)">Show</button>
                             </div>
                         </div>
                         <div class="api-setting-item">
-                            <label for="settingTwilioPhone">Phone Number</label>
-                            <input type="text" id="settingTwilioPhone" data-key="TWILIO_PHONE_NUMBER" placeholder="+1..." class="api-key-input" />
+                            <label for="settingSarvamSpeaker">Speaker (English)</label>
+                            <input type="text" id="settingSarvamSpeaker" data-key="SARVAM_SPEAKER" placeholder="ishita" class="api-key-input" />
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingSarvamSpeakerTa">Speaker (Tamil)</label>
+                            <input type="text" id="settingSarvamSpeakerTa" data-key="SARVAM_SPEAKER_TA" placeholder="ishita (v3: ritu/priya/ratan/rohan)" class="api-key-input" />
+                        </div>
+                    </div>
+
+                    <!-- Vobiz -->
+                    <div class="api-settings-group">
+                        <h4>Vobiz</h4>
+                        <div class="api-setting-item">
+                            <label for="settingVobizAuthId">Auth ID</label>
+                            <input type="text" id="settingVobizAuthId" data-key="VOBIZ_AUTH_ID" placeholder="Vobiz Auth ID" class="api-key-input" />
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingVobizToken">Auth Token</label>
+                            <div class="api-input-row">
+                                <input type="password" id="settingVobizToken" data-key="VOBIZ_AUTH_TOKEN" placeholder="Auth token" class="api-key-input" />
+                                <button class="btn-toggle-vis" title="Show/Hide" onclick="toggleKeyVisibility(this)">Show</button>
+                            </div>
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingVobizPhone">Phone Number</label>
+                            <input type="text" id="settingVobizPhone" data-key="VOBIZ_PHONE_NUMBER" placeholder="+91..." class="api-key-input" />
                         </div>
                     </div>
 
@@ -377,7 +395,7 @@
                     <div class="api-settings-group">
                         <h4>Server</h4>
                         <div class="api-setting-item">
-                            <label for="settingServerUrl">Public URL (for Twilio webhooks)</label>
+                            <label for="settingServerUrl">Public URL (for Vobiz webhooks)</label>
                             <input type="text" id="settingServerUrl" data-key="SERVER_URL" placeholder="https://..." class="api-key-input" />
                         </div>
                     </div>
@@ -409,7 +427,7 @@
 
         <!-- Footer -->
         <footer class="footer">
-            <p>Powered by Twilio • OpenAI • ElevenLabs • GPT-4o</p>
+            <p>Powered by Vobiz &bull; OpenAI Realtime &bull; ElevenLabs &bull; Sarvam AI</p>
         </footer>
     </div>
 
@@ -428,8 +446,8 @@
     <!-- Scripts -->
     <script src="/static/js/websocket-client.js?v=9"></script>
     <script src="/static/js/audio-recorder.js?v=9"></script>
-    <script src="/static/js/audio-player.js?v=9"></script>
-    <script src="/static/js/test-call.js?v=2"></script>
-    <script src="/static/js/main.js?v=15"></script>
+    <script src="/static/js/audio-player.js?v=10"></script>
+    <script src="/static/js/test-call.js?v=3"></script>
+    <script src="/static/js/main.js?v=17"></script>
 </body>
 </html>

@@ -2,8 +2,8 @@
 In-browser Test Call bridge — zero Vobiz credits used.
 
 Reuses VobizRealtimeHandler unchanged so the test call exercises the
-EXACT same prompt, VAD, echo gate, interruption, script, ElevenLabs and
-goodbye logic as a real Vobiz call. A FakeVobizSocket adapter converts
+EXACT same prompt, VAD, echo gate, interruption, script, external TTS
+(ElevenLabs/Sarvam) and goodbye logic as a real Vobiz call. A FakeVobizSocket adapter converts
 between browser PCM16/24k audio and the mulaw/8k format the handler
 expects, so the handler sees input that matches a real phone call.
 """
@@ -18,7 +18,9 @@ from typing import Optional
 
 from fastapi import WebSocket
 
+from config import Config
 from services.vobiz_stream_service import VobizRealtimeHandler
+from services.prewarm_registry import PrewarmRegistry
 from utils.audio_processing import downsample_24k_to_8k, upsample_8k_to_24k
 
 logger = logging.getLogger(__name__)
@@ -78,7 +80,7 @@ async def run_test_call(
     browser_ws: WebSocket,
     active_script: Optional[dict],
     prewarm_task: Optional[asyncio.Task] = None,
-    prewarm_use_elevenlabs: bool = False,
+    prewarm_tts_provider: str = "openai",
     language: str = "en",
 ):
     """
@@ -86,7 +88,8 @@ async def run_test_call(
 
     Browser protocol:
       Client -> server:
-        {"type": "start", "elevenlabs": bool, "language": "en"|"ta"}
+        {"type": "start", "provider": "openai"|"elevenlabs"|"sarvam",
+         "elevenlabs": bool (legacy), "language": "en"|"ta"}
         {"type": "audio_chunk", "data": "<pcm16-24k-b64>"}
         {"type": "stop"}
       Server -> client:
@@ -125,7 +128,12 @@ async def run_test_call(
             mtype = msg.get("type")
 
             if mtype == "start":
-                use_elevenlabs = bool(msg.get("elevenlabs", False))
+                # `provider` wins; the legacy `elevenlabs` bool is honored as fallback.
+                provider = str(msg.get("provider", "")).strip().lower()
+                if provider not in Config.TTS_PROVIDERS:
+                    provider = (
+                        "elevenlabs" if bool(msg.get("elevenlabs", False)) else "openai"
+                    )
                 # Language may be sent in the start message; fall back to the WS query
                 # param value passed into run_test_call.
                 msg_lang = msg.get("language")
@@ -135,24 +143,29 @@ async def run_test_call(
                     else language
                 )
                 handler = VobizRealtimeHandler(
-                    use_elevenlabs=use_elevenlabs,
+                    tts_provider=provider,
                     active_script=active_script,
                     language=call_lang,
                 )
                 handler._transcript_callback = transcript_hook
 
-                if (
-                    prewarm_task
-                    and not prewarm_consumed
-                    and prewarm_use_elevenlabs == use_elevenlabs
-                ):
-                    handler._prewarm_task = prewarm_task
-                    handler._session_preconfigured = True
-                    prewarm_consumed = True
+                if prewarm_task and not prewarm_consumed:
+                    if (
+                        prewarm_tts_provider == provider
+                        and language == call_lang
+                    ):
+                        handler._prewarm_task = prewarm_task
+                        handler._session_preconfigured = True
+                        prewarm_consumed = True
+                    else:
+                        # The UI changed mode/language after the WebSocket opened.
+                        # Do not keep the now-useless pre-warm alive for the call.
+                        await PrewarmRegistry.close_task(prewarm_task)
+                        prewarm_task = None
 
                 stream_id = f"test-{uuid.uuid4().hex[:8]}"
                 call_id = f"test-{uuid.uuid4().hex[:8]}"
-                el_hdr = "true" if use_elevenlabs else "false"
+                el_hdr = "true" if provider == "elevenlabs" else "false"
 
                 await handler.handle_vobiz_message(fake_socket, {
                     "event": "start",
@@ -160,11 +173,13 @@ async def run_test_call(
                         "streamId": stream_id,
                         "callId": call_id,
                     },
-                    "extra_headers": f"elevenlabs={el_hdr},language={call_lang}",
+                    "extra_headers": (
+                        f"provider={provider},elevenlabs={el_hdr},language={call_lang}"
+                    ),
                 })
                 logger.info(
                     f"Test call started — streamId={stream_id}, "
-                    f"elevenlabs={use_elevenlabs}, language={call_lang}, "
+                    f"provider={provider}, language={call_lang}, "
                     f"script={'yes' if active_script else 'no'}"
                 )
 
@@ -202,4 +217,6 @@ async def run_test_call(
                 await handler._full_cleanup()
             except Exception as e:
                 logger.error(f"Test call cleanup failed: {e}")
+        if prewarm_task and not prewarm_consumed:
+            await PrewarmRegistry.close_task(prewarm_task)
         logger.info("Test call session ended")

@@ -1,100 +1,73 @@
+"""Manual zero-audio smoke test for the configured OpenAI Realtime session."""
+
 import asyncio
-import os
 import json
+import time
+
 import websockets
-from dotenv import load_dotenv
 
-load_dotenv()
+from config import Config
 
-async def test():
-    API_KEY = os.getenv("OPENAI_API_KEY")
-    url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-    }
-    
-    async with websockets.connect(url, additional_headers=headers) as ws:
-        print("Connected!")
-        # receive initial events
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                print("Initial:", json.loads(msg)["type"])
-            except asyncio.TimeoutError:
-                break
 
-        print("Sending session.update with semantic_vad")
-        await ws.send(json.dumps({
+async def run_realtime_check():
+    url = f"wss://api.openai.com/v1/realtime?model={Config.REALTIME_MODEL}"
+    headers = {"Authorization": f"Bearer {Config.OPENAI_API_KEY}"}
+
+    async with websockets.connect(
+        url,
+        additional_headers=headers,
+        ping_interval=30,
+        ping_timeout=10,
+        compression=None,
+    ) as ws:
+        config = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["text", "audio"],
-                "voice": "coral",
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                    "language": "en",
+                "output_modalities": ["audio"],
+                "instructions": "Reply briefly and naturally.",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "transcription": {
+                            "model": Config.TRANSCRIPTION_MODEL,
+                            "language": "en",
+                        },
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": Config.SEMANTIC_VAD_EAGERNESS,
+                            "create_response": True,
+                            "interrupt_response": False,
+                        },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": Config.REALTIME_VOICE,
+                    },
                 },
-                "turn_detection": {
-                    "type": "semantic_vad",
-                    "eagerness": "medium",
-                },
-            }
-        }))
-        
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                event = json.loads(msg)
-                print("Received:", event["type"])
-                if event["type"] == "session.updated":
-                    print("Session updated formats:")
-                    print("  input:", event.get("session", {}).get("input_audio_format"))
-                    print("  output:", event.get("session", {}).get("output_audio_format"))
-                    break
-                elif event["type"] == "error":
-                    print("ERROR:", json.dumps(event))
-                    break
-            except asyncio.TimeoutError:
-                print("Timed out!")
-                break
+                "max_output_tokens": 50,
+            },
+        }
+        await ws.send(json.dumps(config))
 
-        print("---\nSending session.update with server_vad")
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "modalities": ["text", "audio"],
-                "voice": "coral",
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                    "language": "en",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                },
-            }
-        }))
-        
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                event = json.loads(msg)
-                print("Received:", event["type"])
-                if event["type"] == "session.updated":
-                    print("Session updated formats:")
-                    print("  input:", event.get("session", {}).get("input_audio_format"))
-                    print("  output:", event.get("session", {}).get("output_audio_format"))
-                    break
-                elif event["type"] == "error":
-                    print("ERROR:", json.dumps(event))
-                    break
-            except asyncio.TimeoutError:
-                print("Timed out!")
-                break
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            event = json.loads(
+                await asyncio.wait_for(ws.recv(), timeout=deadline - time.monotonic())
+            )
+            event_type = event.get("type")
+            if event_type == "session.updated":
+                print(
+                    "Realtime session smoke test passed:",
+                    Config.REALTIME_MODEL,
+                    Config.TRANSCRIPTION_MODEL,
+                )
+                return
+            if event_type == "error":
+                raise RuntimeError(event.get("error", {}).get("message", "Realtime error"))
 
-asyncio.run(test())
+        raise TimeoutError("Timed out waiting for session.updated")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_realtime_check())

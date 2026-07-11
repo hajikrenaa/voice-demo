@@ -16,6 +16,8 @@ class AudioPlayer {
         this.isPCMPlaying = false;
         this.pcmSampleRate = 24000; // OpenAI Realtime API outputs 24kHz
         this.pcmNextStartTime = 0;
+        this.pcmSource = null;
+        this.pcmPlaybackGeneration = 0;
 
         // Callbacks
         this.onPlaybackStart = options.onPlaybackStart || (() => { });
@@ -227,6 +229,9 @@ class AudioPlayer {
     enqueuePCM(base64Audio) {
         // Initialize audio context if needed
         this.initializePCM();
+        if (this.audioContext.state === 'suspended') {
+            this.audioContext.resume().catch((error) => this.onError(error));
+        }
 
         // Decode base64 to Int16Array
         const binaryString = atob(base64Audio);
@@ -284,6 +289,8 @@ class AudioPlayer {
 
         const audioBuffer = this.pcmQueue.shift();
         const source = this.audioContext.createBufferSource();
+        const generation = this.pcmPlaybackGeneration;
+        this.pcmSource = source;
         source.buffer = audioBuffer;
         source.connect(this.audioContext.destination);
 
@@ -296,7 +303,11 @@ class AudioPlayer {
 
         // Continue to next buffer when this one ends
         source.onended = () => {
-            this.playNextPCM();
+            try { source.disconnect(); } catch (_) { /* already disconnected */ }
+            if (this.pcmSource === source) this.pcmSource = null;
+            if (generation === this.pcmPlaybackGeneration && this.isPCMPlaying) {
+                this.playNextPCM();
+            }
         };
     }
 
@@ -304,9 +315,18 @@ class AudioPlayer {
      * Stop PCM playback and clear queue
      */
     stopPCM() {
+        this.pcmPlaybackGeneration++;
         this.pcmQueue = [];
         this.isPCMPlaying = false;
         this.pcmNextStartTime = 0;
+
+        const source = this.pcmSource;
+        this.pcmSource = null;
+        if (source) {
+            source.onended = null;
+            try { source.stop(); } catch (_) { /* source may already be stopped */ }
+            try { source.disconnect(); } catch (_) { /* already disconnected */ }
+        }
 
         if (this.hasCalledPlaybackStart) {
             this.hasCalledPlaybackStart = false;
@@ -333,7 +353,13 @@ class AudioPlayer {
      */
     cleanup() {
         this.stop();
+        this.stopPCM();
         this.clearQueue();
+        const context = this.audioContext;
+        this.audioContext = null;
+        if (context && context.state !== 'closed') {
+            context.close().catch((error) => console.debug('AudioContext close failed', error));
+        }
         console.log('Audio player cleaned up');
     }
 }

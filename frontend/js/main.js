@@ -252,16 +252,29 @@ function setupUIHandlers() {
         }
     });
 
-    // ElevenLabs toggle hint text
-    const toggleElevenLabs = document.getElementById('toggleElevenLabs');
+    // Voice provider dropdown hint text
+    const voiceProviderSelect = document.getElementById('voiceProviderSelect');
     const voiceHint = document.getElementById('voiceHint');
-    if (toggleElevenLabs) {
-        toggleElevenLabs.addEventListener('change', () => {
-            voiceHint.textContent = toggleElevenLabs.checked
-                ? '(Using ElevenLabs voice)'
-                : '(Using OpenAI built-in voice)';
+    if (voiceProviderSelect) {
+        voiceProviderSelect.addEventListener('change', () => {
+            voiceHint.textContent = voiceProviderHint(voiceProviderSelect.value);
         });
     }
+
+    // Persist per-call selections across page refreshes. A refresh silently
+    // reset Language to English once, and a "Tamil" call went out as English.
+    ['langSelect', 'voiceProviderSelect', 'testVoiceProviderSelect'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const saved = localStorage.getItem('pref_' + id);
+        if (saved && [...el.options].some(o => o.value === saved)) {
+            el.value = saved;
+            el.dispatchEvent(new Event('change'));
+        }
+        el.addEventListener('change', () => {
+            localStorage.setItem('pref_' + id, el.value);
+        });
+    });
 
     // --- Call Mode Tabs (Live / Test) ---
     setupCallTabs();
@@ -376,12 +389,22 @@ async function loadApiSettings() {
         const data = await res.json();
         const settings = data.settings || {};
 
-        // Fill each input that has a data-key attribute
+        // Fill each input that has a data-key attribute. Masked secrets are shown
+        // only as a placeholder — never put the mask into input.value, or a save
+        // of an unrelated field would write the literal mask string into .env
+        // (short secrets mask to <4 asterisks and slip past any mask filter).
         document.querySelectorAll('.api-key-input[data-key]').forEach(input => {
             const key = input.dataset.key;
             if (settings[key]) {
-                input.value = settings[key].value || '';
-                input.placeholder = settings[key].masked ? 'Enter new value to update' : '';
+                if (settings[key].masked) {
+                    input.value = '';
+                    input.placeholder = settings[key].value
+                        ? `${settings[key].value} — enter new value to update`
+                        : 'Enter new value to update';
+                } else {
+                    input.value = settings[key].value || '';
+                    input.placeholder = '';
+                }
             }
         });
     } catch (e) {
@@ -397,12 +420,13 @@ async function saveApiSettings() {
     const statusEl = document.getElementById('saveStatus');
     const updates = {};
 
-    // Collect all non-empty inputs
+    // Collect all non-empty inputs. Masked secrets live in the placeholder, so
+    // any typed value here is a real new value; keep the mask sniff only as a
+    // belt-and-braces guard against pasting a masked string back in.
     document.querySelectorAll('.api-key-input[data-key]').forEach(input => {
         const key = input.dataset.key;
         const val = input.value.trim();
-        // Only send if value is present and not a masked placeholder
-        if (val && !val.includes('****')) {
+        if (val && !val.includes('***')) {
             updates[key] = val;
         }
     });
@@ -1287,6 +1311,21 @@ function getSelectedLanguage() {
 }
 
 /**
+ * Read a voice provider dropdown ("openai" | "elevenlabs" | "sarvam").
+ */
+function getVoiceProvider(selectId) {
+    const el = document.getElementById(selectId);
+    const value = el ? el.value : 'openai';
+    return ['openai', 'elevenlabs', 'sarvam'].includes(value) ? value : 'openai';
+}
+
+function voiceProviderHint(provider) {
+    if (provider === 'elevenlabs') return '(Using ElevenLabs voice)';
+    if (provider === 'sarvam') return '(Using Sarvam AI voice)';
+    return '(Using OpenAI built-in voice)';
+}
+
+/**
  * Make an outbound call via Vobiz
  */
 async function makeOutboundCall() {
@@ -1306,7 +1345,7 @@ async function makeOutboundCall() {
     }
 
     const dialNumber = cleaned.startsWith('+') ? cleaned : '+' + cleaned;
-    const useElevenLabs = document.getElementById('toggleElevenLabs')?.checked || false;
+    const voiceProvider = getVoiceProvider('voiceProviderSelect');
     const language = getSelectedLanguage();
 
     try {
@@ -1320,7 +1359,12 @@ async function makeOutboundCall() {
         const response = await authFetch('/vobiz/outbound-call', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to: dialNumber, elevenlabs: useElevenLabs, language })
+            body: JSON.stringify({
+                to: dialNumber,
+                voice_provider: voiceProvider,
+                elevenlabs: voiceProvider === 'elevenlabs',
+                language
+            })
         });
 
         const data = await response.json();
@@ -1444,16 +1488,14 @@ function setupTestCall() {
     const statusEl = document.getElementById('testCallStatus');
     const statusText = document.getElementById('testCallStatusText');
     const transcriptEl = document.getElementById('testCallTranscript');
-    const toggleEl = document.getElementById('testToggleElevenLabs');
+    const providerEl = document.getElementById('testVoiceProviderSelect');
     const voiceHint = document.getElementById('testVoiceHint');
 
     if (!btnStart || !btnEnd || !statusEl || !statusText || !transcriptEl) return;
 
-    if (toggleEl && voiceHint) {
-        toggleEl.addEventListener('change', () => {
-            voiceHint.textContent = toggleEl.checked
-                ? '(Using ElevenLabs voice)'
-                : '(Using OpenAI built-in voice)';
+    if (providerEl && voiceHint) {
+        providerEl.addEventListener('change', () => {
+            voiceHint.textContent = voiceProviderHint(providerEl.value);
         });
     }
 
@@ -1496,7 +1538,7 @@ function setupTestCall() {
         showEndUI();
 
         testCallClient = new TestCallClient({
-            elevenlabs: !!(toggleEl && toggleEl.checked),
+            provider: getVoiceProvider('testVoiceProviderSelect'),
             language: getSelectedLanguage(),
             onStatus: (kind, text) => setStatus(kind, text),
             onTranscript: (role, text) => appendTranscript(role, text),

@@ -10,3 +10,4 @@ pydub==0.25.1
 # vobiz uses REST API via httpx (already listed below) — no extra SDK needed
 elevenlabs==1.50.0
 httpx==0.28.1
+audioop-lts==0.2.2; python_version >= "3.13"
