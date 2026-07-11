@@ -472,6 +472,9 @@ class VobizRealtimeHandler:
         # stop suppressing replies after a couple — a wrong reply beats a mute
         # agent.
         self._pre_welcome_suppressions = 0
+        # Deadline (monotonic) until which a newly-created response is treated
+        # as the server's auto-answer to a backchannel and suppressed. 0 = off.
+        self._suppress_bc_response_until = 0.0
         # False until this response's first TTS piece went out — the first piece
         # may flush early at a clause boundary to cut time-to-first-audio.
         self._first_piece_flushed = False
@@ -1543,6 +1546,11 @@ class VobizRealtimeHandler:
             self._response_audio_started_at = 0.0
             self._last_response_text = ""
             self._discard_response_text = False
+            # Any text still in the TTS buffer belongs to a PREVIOUS response
+            # that a cancel/suppression withheld — if it leaks into this one,
+            # two responses merge into a single garbled TTS chunk (live
+            # 2026-07-11: "What is your current CTC?I'm sorry,").
+            self._response_text_buffer = ""
             if (self.use_elevenlabs and not self._is_first_response
                     and not self._any_real_audio_sent
                     and self._pre_welcome_suppressions < 2):
@@ -1566,6 +1574,27 @@ class VobizRealtimeHandler:
                         )
                 except Exception as e:
                     logger.debug(f"Could not suppress pre-welcome reply: {e}")
+            elif (self.use_elevenlabs
+                    and time.monotonic() < self._suppress_bc_response_until):
+                # This response answers a micro-turn we just ruled a BACKCHANNEL
+                # ("mm-hm" during agent speech) — server VAD auto-creates it
+                # anyway. Answering a backchannel re-asks the question the
+                # caller already heard (live 2026-07-11: "May I know your
+                # name?" delivered 3x in a row). Cancel + discard.
+                self._suppress_bc_response_until = 0.0
+                self._discard_response_text = True
+                self._suppress_recovery_once = True
+                self._cancel_requested = True
+                try:
+                    ws = self.openai_ws
+                    if ws:
+                        await ws.send(json.dumps({"type": "response.cancel"}))
+                        logger.info(
+                            "Suppressed auto-reply to backchannel — prior "
+                            "reply already answered the caller"
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not suppress backchannel reply: {e}")
 
         elif t in ("response.output_item.added", "response.output_item.created"):
             item = event.get("item", {}) or {}
@@ -1694,20 +1723,42 @@ class VobizRealtimeHandler:
                 if saved_transcript and len(saved_transcript) > 20 and not suppress_recovery:
                     await self._inject_interrupt_recovery()
             else:
+                if self.use_elevenlabs and self._response_text_buffer.strip():
+                    # This response COMPLETED but its tail never flushed at
+                    # text.done — a cancel that missed its target left
+                    # _cancel_requested stale-True. Withholding it cuts the
+                    # answer mid-sentence; flush it now (a later interruption
+                    # ruling still drains the queue normally).
+                    text = self._response_text_buffer.strip()
+                    self._response_text_buffer = ""
+                    logger.info(f"[flush-done] {text[:60]}")
+                    await self._enqueue_tts(text)
                 self._current_ai_transcript = ""
                 logger.debug(f"Response complete (status={status})")
             self._cancel_requested = False
             if self._response_create_pending:
-                # The server-VAD auto-create for the caller's last turn was
-                # rejected while this response was finalizing — fire it now.
                 self._response_create_pending = False
-                try:
-                    ws = self.openai_ws
-                    if ws:
-                        await ws.send(json.dumps({"type": "response.create"}))
-                        logger.info("Retried rejected response.create after response.done")
-                except Exception as e:
-                    logger.warning(f"Could not retry response.create: {e}")
+                if status == "cancelled":
+                    # The create for the caller's turn was rejected while the
+                    # old response finalized its cancel — fire it now, otherwise
+                    # the turn is never answered (dead air, live 2026-07-09).
+                    try:
+                        ws = self.openai_ws
+                        if ws:
+                            await ws.send(json.dumps({"type": "response.create"}))
+                            logger.info("Retried rejected response.create after response.done")
+                    except Exception as e:
+                        logger.warning(f"Could not retry response.create: {e}")
+                else:
+                    # The response that just finalized COMPLETED — the caller's
+                    # turn already has its answer. Firing the pending create on
+                    # top of it produced a second full answer (re-greeting +
+                    # repeated question) stacked in the TTS queue: the "agent
+                    # talking over itself" live bug 2026-07-11 01:49.
+                    logger.info(
+                        f"Dropped pending response.create — turn already "
+                        f"answered (status={status})"
+                    )
 
         elif t == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
@@ -1926,6 +1977,14 @@ class VobizRealtimeHandler:
                         f"Backchannel ({speech_duration_ms:.0f}ms < "
                         f"{Config.BACKCHANNEL_MAX_DURATION_MS}ms) — not draining"
                     )
+                    if not self._ai_is_responding:
+                        # Server VAD will still auto-create an answer for this
+                        # micro-turn; arm a short window so response.created
+                        # can suppress it (a backchannel needs no reply — the
+                        # prior response already played). Active generation is
+                        # left alone: its create gets rejected server-side and
+                        # response.done drops the retry for completed answers.
+                        self._suppress_bc_response_until = time.monotonic() + 2.0
                     # Words buffered during the evaluation window resume playing.
                     await self._flush_pending_audio()
                 else:

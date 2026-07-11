@@ -810,3 +810,146 @@ def test_interruption_discards_inflight_external_tts_audio():
         assert vobiz.messages == []
 
     asyncio.run(scenario())
+
+
+def test_pending_create_dropped_when_response_completed():
+    # Live 2026-07-11 01:49: the barge-in recovery armed a re-create, but its
+    # response.cancel missed — the server's auto-answer COMPLETED, and the
+    # retried create generated a second full answer (re-greeting + repeated
+    # question) stacked behind the first in the TTS queue.
+    class FakeOpenAIWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, message):
+            self.sent.append(json.loads(message))
+
+    async def scenario():
+        handler = VobizRealtimeHandler()
+        ws = FakeOpenAIWebSocket()
+        handler.openai_ws = ws
+        handler._is_first_response = False
+        handler._response_create_pending = True
+
+        await handler._handle_openai_event({
+            "type": "response.done",
+            "response": {"status": "completed"},
+        })
+
+        assert handler._response_create_pending is False
+        assert {"type": "response.create"} not in ws.sent
+
+    asyncio.run(scenario())
+
+
+def test_response_created_clears_stale_text_buffer():
+    # Live 2026-07-11 01:51: a withheld tail from a cancelled response merged
+    # into the next response's text — one TTS chunk read
+    # "What is your current CTC?I'm sorry," with no boundary.
+    async def scenario():
+        handler = VobizRealtimeHandler()
+        handler._is_first_response = False
+        handler._any_real_audio_sent = True
+        handler._response_text_buffer = "What is your current CTC?"
+
+        await handler._handle_openai_event({"type": "response.created"})
+
+        assert handler._response_text_buffer == ""
+
+    asyncio.run(scenario())
+
+
+def test_backchannel_auto_reply_is_suppressed():
+    # Live 2026-07-11 01:49: a 564ms "mm-hm" was correctly ruled a backchannel,
+    # but server VAD still auto-created an answer to it — the agent re-asked a
+    # question the caller had already heard (3x in a row).
+    class FakeOpenAIWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, message):
+            self.sent.append(json.loads(message))
+
+    async def scenario():
+        handler = VobizRealtimeHandler(use_elevenlabs=True)
+        ws = FakeOpenAIWebSocket()
+        handler.openai_ws = ws
+        handler._is_first_response = False
+        handler._any_real_audio_sent = True
+        handler._ai_is_responding = False
+        handler._estimated_playback_end = time.monotonic() + 5.0
+
+        await handler._handle_openai_event({
+            "type": "input_audio_buffer.speech_started",
+        })
+        assert handler._interrupt_pending is True
+
+        handler._speech_start_time = time.monotonic() - 0.1  # 100ms → backchannel
+        await handler._handle_openai_event({
+            "type": "input_audio_buffer.speech_stopped",
+        })
+        assert handler._suppress_bc_response_until > time.monotonic()
+
+        await handler._handle_openai_event({"type": "response.created"})
+        assert {"type": "response.cancel"} in ws.sent
+        assert handler._discard_response_text is True
+        assert handler._suppress_bc_response_until == 0.0  # one-shot
+
+        # The suppressed reply's text never reaches the TTS buffer.
+        await handler._handle_openai_event({
+            "type": "response.text.delta", "delta": "May I know your name?",
+        })
+        assert handler._response_text_buffer == ""
+
+    asyncio.run(scenario())
+
+
+def test_backchannel_suppression_not_armed_while_generating():
+    # An actively-generating response must be left alone: its rejected
+    # auto-create is dropped at response.done instead (see
+    # test_pending_create_dropped_when_response_completed).
+    async def scenario():
+        handler = VobizRealtimeHandler()
+        handler._is_first_response = False
+        handler._any_real_audio_sent = True
+        handler._ai_is_responding = True
+
+        await handler._handle_openai_event({
+            "type": "input_audio_buffer.speech_started",
+        })
+        handler._speech_start_time = time.monotonic() - 0.1
+        await handler._handle_openai_event({
+            "type": "input_audio_buffer.speech_stopped",
+        })
+
+        assert handler._suppress_bc_response_until == 0.0
+
+    asyncio.run(scenario())
+
+
+def test_completed_response_tail_is_flushed_at_done():
+    # A cancel that missed leaves _cancel_requested stale-True, which withheld
+    # the completed response's tail at text.done — the caller heard only half
+    # the answer. response.done must flush it.
+    async def scenario():
+        handler = VobizRealtimeHandler(use_elevenlabs=True)
+        handler._is_first_response = False
+        handler._cancel_requested = True  # stale — the cancel never landed
+        handler._response_text_buffer = "May I know your name?"
+        enqueued = []
+
+        async def fake_enqueue(text):
+            enqueued.append(text)
+
+        handler._enqueue_tts = fake_enqueue
+
+        await handler._handle_openai_event({
+            "type": "response.done",
+            "response": {"status": "completed"},
+        })
+
+        assert enqueued == ["May I know your name?"]
+        assert handler._response_text_buffer == ""
+        assert handler._cancel_requested is False
+
+    asyncio.run(scenario())
