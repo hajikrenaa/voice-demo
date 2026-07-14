@@ -435,6 +435,31 @@ def test_called_number_lands_in_prompts():
     assert "+918110016139" in handler_en._build_prompt()
 
 
+def test_english_prompt_bans_intro_repeat_and_number_invention():
+    # Call 4 (2026-07-12): bot re-pitched the full intro 3x on "hello?" and
+    # invented numbers. Rules 9b + 11b target both.
+    h = VobizRealtimeHandler(
+        tts_provider="elevenlabs", language="en",
+        active_script={"welcome": "Hi", "questions": ["Q1"], "goal": "g"},
+    )
+    p = h._build_prompt()
+    assert "INTRODUCE YOURSELF ONCE" in p
+    assert "AMBIGUOUS NUMBERS" in p
+
+
+def test_tamil_full_prompt_bans_self_spelling_and_number_invention():
+    # Call 1: bot spelled a confirmed name "C-A-L-A-I-V-A-N-I" unprompted.
+    # Call 3: "thousand fifteen hundred" -> confirmed "12,500". gpt-realtime
+    # (full) Tamil path.
+    h = VobizRealtimeHandler(
+        tts_provider="sarvam", language="ta",
+        active_script={"welcome": "Hi", "questions": ["Q1"], "goal": "g"},
+    )
+    p = h._build_prompt()
+    assert "C-A-L-A-I" in p          # the self-spelling example is banned
+    assert "thousand fifteen hundred" in p  # the ambiguous-number example
+
+
 def test_heard_text_resets_each_response():
     async def scenario():
         handler = VobizRealtimeHandler(tts_provider="sarvam", language="ta")
