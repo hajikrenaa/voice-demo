@@ -362,12 +362,28 @@
                             </div>
                         </div>
                         <div class="api-setting-item">
+                            <label for="settingSarvamModel">Model</label>
+                            <select id="settingSarvamModel" data-key="SARVAM_TTS_MODEL" class="api-key-input">
+                                <option value="bulbul:v3">bulbul:v3 — better Tamil (recommended)</option>
+                                <option value="bulbul:v2">bulbul:v2 — cheaper (~½ cost), weaker Tamil</option>
+                            </select>
+                        </div>
+                        <div class="api-setting-item">
                             <label for="settingSarvamSpeaker">Speaker (English)</label>
-                            <input type="text" id="settingSarvamSpeaker" data-key="SARVAM_SPEAKER" placeholder="ishita" class="api-key-input" />
+                            <select id="settingSarvamSpeaker" data-key="SARVAM_SPEAKER" class="api-key-input"></select>
                         </div>
                         <div class="api-setting-item">
                             <label for="settingSarvamSpeakerTa">Speaker (Tamil)</label>
-                            <input type="text" id="settingSarvamSpeakerTa" data-key="SARVAM_SPEAKER_TA" placeholder="ishita (v3: ritu/priya/ratan/rohan)" class="api-key-input" />
+                            <select id="settingSarvamSpeakerTa" data-key="SARVAM_SPEAKER_TA" class="api-key-input"></select>
+                        </div>
+                        <p class="api-setting-hint">Speaker options change with the model — voices are model-specific. Ear-test samples: <code>voice-samples\v3_compare.html</code></p>
+                        <div class="api-setting-item">
+                            <label for="settingSarvamTemp">Temperature <span class="api-hint-inline">(higher = more natural/expressive, more artifacts · 0.3–0.9)</span></label>
+                            <input type="number" id="settingSarvamTemp" data-key="SARVAM_TTS_TEMPERATURE" min="0" max="1" step="0.05" placeholder="0.6" class="api-key-input" />
+                        </div>
+                        <div class="api-setting-item">
+                            <label for="settingSarvamPace">Pace <span class="api-hint-inline">(1.0 = normal, lower = slower/clearer · 0.7–1.3)</span></label>
+                            <input type="number" id="settingSarvamPace" data-key="SARVAM_TTS_PACE" min="0.5" max="2" step="0.05" placeholder="1.0" class="api-key-input" />
                         </div>
                     </div>
 

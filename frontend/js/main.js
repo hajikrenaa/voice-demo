@@ -407,9 +407,66 @@ async function loadApiSettings() {
                 }
             }
         });
+
+        // Sarvam model + speaker are coupled: the speaker dropdowns only make
+        // sense once the model is known (voices are model-specific), and the
+        // generic loop above can't fill a <select> whose options don't exist
+        // yet. Populate them explicitly from the loaded model here.
+        const modelSel = document.getElementById('settingSarvamModel');
+        if (modelSel) {
+            const model = (settings.SARVAM_TTS_MODEL && settings.SARVAM_TTS_MODEL.value) || 'bulbul:v3';
+            modelSel.value = model;
+            populateSarvamSpeakers(
+                model,
+                settings.SARVAM_SPEAKER ? settings.SARVAM_SPEAKER.value : '',
+                settings.SARVAM_SPEAKER_TA ? settings.SARVAM_SPEAKER_TA.value : ''
+            );
+            // Switching model re-lists the speakers; a speaker from the other
+            // model is invalid and falls back to that model's default.
+            modelSel.onchange = () => populateSarvamSpeakers(
+                modelSel.value,
+                document.getElementById('settingSarvamSpeaker').value,
+                document.getElementById('settingSarvamSpeakerTa').value
+            );
+        }
     } catch (e) {
         console.error('Failed to load settings:', e);
     }
+}
+
+// Sarvam speaker sets are DISJOINT per model — mirror of main.py's
+// _SARVAM_MODEL_SPEAKERS so the UI can never offer a cross-model voice.
+const SARVAM_MODEL_SPEAKERS = {
+    'bulbul:v3': [
+        'ishita', 'ritu', 'kavitha', 'priya', 'shreya', 'ratan', 'rohan', 'aditya',
+        'shubh', 'neha', 'rahul', 'pooja', 'simran', 'kavya', 'amit', 'dev',
+        'varun', 'manan', 'sumit', 'roopa', 'kabir', 'aayan', 'ashutosh', 'advait',
+        'amelia', 'sophia', 'anand', 'tanya', 'tarun', 'sunny', 'mani', 'gokul',
+        'vijay', 'shruti', 'suhani', 'mohit', 'rehan', 'soham', 'rupali',
+    ],
+    'bulbul:v2': ['karun', 'anushka', 'manisha', 'vidya', 'arya', 'abhilash', 'hitesh'],
+};
+const SARVAM_DEFAULT_SPEAKER = { 'bulbul:v3': 'ishita', 'bulbul:v2': 'karun' };
+// Voices Sarvam documents as strong for Tamil (flagged in the dropdown).
+const SARVAM_TAMIL_PICKS = new Set(['ishita', 'ritu', 'kavitha', 'priya', 'ratan', 'rohan', 'aditya', 'karun']);
+
+function _fillSpeakerSelect(sel, options, desired, fallback) {
+    if (!sel) return;
+    sel.innerHTML = '';
+    for (const name of options) {
+        const o = document.createElement('option');
+        o.value = name;
+        o.textContent = SARVAM_TAMIL_PICKS.has(name) ? `${name} — Tamil ✓` : name;
+        sel.appendChild(o);
+    }
+    sel.value = options.includes(desired) ? desired : fallback;
+}
+
+function populateSarvamSpeakers(model, enVal, taVal) {
+    const opts = SARVAM_MODEL_SPEAKERS[model] || SARVAM_MODEL_SPEAKERS['bulbul:v3'];
+    const def = SARVAM_DEFAULT_SPEAKER[model] || 'ishita';
+    _fillSpeakerSelect(document.getElementById('settingSarvamSpeaker'), opts, enVal, def);
+    _fillSpeakerSelect(document.getElementById('settingSarvamSpeakerTa'), opts, taVal, def);
 }
 
 /**

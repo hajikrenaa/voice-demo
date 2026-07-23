@@ -1496,6 +1496,32 @@ body {
     font-family: inherit;
 }
 
+select.api-key-input {
+    cursor: pointer;
+    font-family: inherit;
+    appearance: auto;
+}
+
+.api-setting-hint {
+    font-size: 0.75rem;
+    color: #64748b;
+    margin: -4px 0 12px;
+    line-height: 1.4;
+}
+
+.api-setting-hint code {
+    background: #eef2f7;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.72rem;
+}
+
+.api-hint-inline {
+    font-weight: 400;
+    color: #94a3b8;
+    font-size: 0.72rem;
+}
+
 .btn-toggle-vis {
     padding: 10px 14px;
     background: #f1f5f9;

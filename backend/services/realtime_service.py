@@ -168,15 +168,25 @@ class RealtimeService:
                     event_type = event.get("type", "")
                     
                     # Log important events
-                    if event_type not in ["response.audio.delta"]:
+                    if event_type not in ("response.audio.delta",
+                                          "response.output_audio.delta"):
                         logger.debug(f"Received event: {event_type}")
-                    
+
+                    # Track response start. Under server_vad OpenAI creates
+                    # responses on its own — create_response() is only reached
+                    # via an explicit client commit, which the browser never
+                    # sends. Without this the flag stayed False forever, so
+                    # barge-in never cancelled anything and every manual
+                    # interrupt hit a no-active-response API error.
+                    if event_type == "response.created":
+                        self._response_in_progress = True
+
                     yield event
-                    
+
                     # Track response completion
                     if event_type == "response.done":
                         self._response_in_progress = False
-                        
+
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse event: {e}")
                     
@@ -228,16 +238,30 @@ class RealtimeEventHandler:
         self.realtime = realtime_service
         self.transcription_text = ""
         self.response_text = ""
-        
+
+    # GA Realtime renamed the response.* streaming events. _configure_session
+    # sends the GA session shape, so GA names are what actually arrive — without
+    # this map the browser path matched nothing and played no audio at all.
+    # Mirrors VobizRealtimeHandler._GA_EVENT_ALIAS; keep the two in sync.
+    _GA_EVENT_ALIAS = {
+        "response.output_audio.delta": "response.audio.delta",
+        "response.output_audio.done": "response.audio.done",
+        "response.output_audio_transcript.delta": "response.audio_transcript.delta",
+        "response.output_audio_transcript.done": "response.audio_transcript.done",
+        "response.output_text.delta": "response.text.delta",
+        "response.output_text.done": "response.text.done",
+    }
+
     async def handle_event(self, event: dict):
         """
         Process an event from OpenAI and forward to client.
-        
+
         Args:
             event: Event dict from Realtime API
         """
         event_type = event.get("type", "")
-        
+        event_type = self._GA_EVENT_ALIAS.get(event_type, event_type)
+
         # Session events
         if event_type == "session.created":
             await self.client_ws.send_json({

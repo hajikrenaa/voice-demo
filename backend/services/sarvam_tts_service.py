@@ -45,6 +45,12 @@ class SarvamTTSService:
     # timeout would; if Sarvam is this slow the bridge's OpenAI fallback is better.
     REST_TIMEOUT_S = 8.0
     WS_CONNECT_TIMEOUT_S = 5.0
+    # Kept at 10s deliberately: Sarvam's first chunk has been measured swinging
+    # 0.6-14s under load, so a tighter bound fails synthesis that would have
+    # succeeded. The chain's total is bounded where it belongs instead — by
+    # VobizRealtimeHandler._EXTERNAL_TTS_DEADLINE_S, which wraps the whole
+    # attempt so a stall still reaches the OpenAI TTS fallback rather than
+    # blowing past the TTS worker's kill switch and dropping the sentence.
     WS_CHUNK_TIMEOUT_S = 10.0
     # Sarvam idle-drops at ~60s. 30s + the last-activity skip gave a worst-case
     # ~60s ping gap — a long caller monologue could silently kill the socket and

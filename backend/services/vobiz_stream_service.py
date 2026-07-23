@@ -445,7 +445,9 @@ class VobizRealtimeHandler:
         self._external_tts = (
             self._make_external_tts() if self.use_elevenlabs else None
         )
-        self._external_tts_available = True
+        # External TTS is skipped in favour of OpenAI TTS until this monotonic
+        # deadline. 0.0 = available now. Set on failure, never latched forever.
+        self._external_tts_retry_at = 0.0
         self._openai_tts_client = None
         self._response_text_buffer = ""
         # Text pieces of the CURRENT response that actually reached the caller
@@ -489,6 +491,9 @@ class VobizRealtimeHandler:
         self._tts_worker_task = None
         self._tts_generation = 0
         self._receive_task: Optional[asyncio.Task] = None
+        # Background one-shot tasks (fillers, watchdogs, gentle clears). Held so
+        # the GC can't collect them mid-flight and so cleanup can cancel them.
+        self._bg_tasks: set[asyncio.Task] = set()
         # Script passed directly from main.py at call time
         self._script: Optional[dict] = active_script
         self._goodbye_detected = False
@@ -516,6 +521,8 @@ class VobizRealtimeHandler:
         # the caller's turn is never silently dropped (live-call dead-air bug).
         self._response_create_pending = False
         self._speech_start_time = 0.0
+        # audio_start_ms from the last speech_started event (buffer-relative).
+        self._speech_start_audio_ms: Optional[int] = None
         self._first_audio_chunk = True
         self._audio_chunk_count = 0
         self._response_start_time = 0.0
@@ -650,7 +657,7 @@ class VobizRealtimeHandler:
             # so the right voice/language_code apply even when they arrived via headers.
             if self.use_elevenlabs and not self._tts_worker_task:
                 self._external_tts = self._make_external_tts()
-                self._external_tts_available = True
+                self._external_tts_retry_at = 0.0
                 self._tts_worker_task = asyncio.create_task(self._tts_worker())
                 # Sarvam speaks over a persistent streaming WS; open it now so the
                 # ~0.7-1s handshake overlaps OpenAI session setup instead of
@@ -1484,12 +1491,47 @@ class VobizRealtimeHandler:
 
     # ── OpenAI event processing ─────────────────────────────────────────────
 
+    def _measure_speech_duration_ms(self, stopped_event: dict) -> float:
+        """How long the caller ACTUALLY spoke, for the backchannel ruling.
+
+        Wall-clock (speech_stopped arrival − speech_started arrival) is the wrong
+        quantity: server VAD only emits speech_stopped after observing
+        VAD_SILENCE_DURATION_MS of silence, so wall-clock is
+        true_speech + silence_window + event RTT. With the production settings
+        (silence 500ms, backchannel cap 600ms) that left ~100ms of real budget —
+        a genuine 150ms "ம்ம்" measured ~650ms and was ruled a full interruption,
+        cutting the agent off mid-sentence on every acknowledgement.
+
+        OpenAI reports buffer-relative audio_start_ms / audio_end_ms, which are
+        more precise than wall-clock but are NOT the raw speech boundaries: per
+        the Realtime event reference audio_start_ms "includes the
+        prefix_padding_ms configured in the Session" and audio_end_ms "includes
+        the silence_duration_ms". Their difference therefore over-reports by
+        prefix + silence (620ms live) and must have both subtracted — taking the
+        span raw leaves the same 150ms hum measuring 770ms and changes nothing.
+
+        Fall back to wall-clock (minus the silence window) when the fields are
+        absent, and also when the subtraction goes negative: that would mean the
+        events are not padded as documented, and clamping to zero instead would
+        rule EVERY turn a backchannel and silently disable barge-in altogether.
+        """
+        audio_end_ms = stopped_event.get("audio_end_ms")
+        audio_start_ms = self._speech_start_audio_ms
+        if isinstance(audio_end_ms, (int, float)) and isinstance(audio_start_ms, (int, float)):
+            span_ms = float(audio_end_ms) - float(audio_start_ms)
+            true_ms = span_ms - Config.VAD_PREFIX_PADDING_MS - Config.VAD_SILENCE_DURATION_MS
+            if true_ms >= 0:
+                return true_ms
+        wall_ms = (time.monotonic() - self._speech_start_time) * 1000
+        return max(0.0, wall_ms - Config.VAD_SILENCE_DURATION_MS)
+
     async def _receive_openai_events(self):
         """Receive events from OpenAI and forward audio to Vobiz."""
-        if not self.openai_ws:
+        ws = self.openai_ws
+        if not ws:
             return
         try:
-            async for raw in self.openai_ws:
+            async for raw in ws:
                 try:
                     event = json.loads(raw)
                     await self._handle_openai_event(event)
@@ -1504,6 +1546,16 @@ class VobizRealtimeHandler:
         except Exception as e:
             logger.error(f"Error receiving OpenAI events: {e}")
         finally:
+            if ws is not self.openai_ws:
+                # The socket this loop owned was swapped out from under it —
+                # i.e. _restart_session ("start over") closed it deliberately and
+                # a replacement receive task is already live on a new socket.
+                # Reading _connected here would see the NEW connection's True and
+                # close the caller's media stream; clearing it would deafen the
+                # bridge for the rest of the call. Identity is self-clearing, so
+                # unlike a flag it cannot leak and stays correct for N restarts.
+                logger.info("Old receive task exited after session restart")
+                return
             was_active = self._connected
             self._connected = False
             if (
@@ -1969,6 +2021,10 @@ class VobizRealtimeHandler:
             else:
                 self._cancel_hangup()
             self._speech_start_time = time.monotonic()
+            # OpenAI reports where speech actually began in the input buffer.
+            # Paired with speech_stopped's audio_end_ms this gives the TRUE
+            # speech duration — see the backchannel ruling in speech_stopped.
+            self._speech_start_audio_ms = event.get("audio_start_ms")
             # Arm the listening backchannel for this utterance (fires only if
             # the caller is STILL talking after ~4.5s of agent silence).
             if self._listen_bc_task and not self._listen_bc_task.done():
@@ -1992,7 +2048,7 @@ class VobizRealtimeHandler:
                     # Barge-in on the welcome: cancel immediately, skip backchannel heuristic.
                     logger.info("Caller spoke during welcome — hard interrupt")
                     self._interrupt_pending = True
-                    asyncio.create_task(
+                    self._spawn_bg(
                         self._resolve_stuck_interrupt(self._speech_start_time)
                     )
                     self._drain_tts_queue()
@@ -2011,7 +2067,7 @@ class VobizRealtimeHandler:
                 else:
                     logger.info("User speech during AI response — clearing Vobiz buffer (pending eval)")
                     self._interrupt_pending = True
-                    asyncio.create_task(
+                    self._spawn_bg(
                         self._gentle_clear(Config.INTERRUPTION_EVAL_DELAY_MS / 1000.0)
                     )
                     # Watchdog: if speech_stopped never arrives (echo-gated
@@ -2019,7 +2075,7 @@ class VobizRealtimeHandler:
                     # mute the agent for the REST OF THE CALL (observed live
                     # 2026-07-10 02:07 — 30s of dead air until the caller gave
                     # up). Resolve conservatively after a bound.
-                    asyncio.create_task(
+                    self._spawn_bg(
                         self._resolve_stuck_interrupt(self._speech_start_time)
                     )
 
@@ -2030,9 +2086,9 @@ class VobizRealtimeHandler:
                 self._listen_bc_task.cancel()
             # Perceived-latency mask: if the real reply hasn't reached the
             # caller shortly, play a neutral pre-synthesized "ம்ம்..." clip.
-            asyncio.create_task(self._maybe_play_filler())
+            self._spawn_bg(self._maybe_play_filler())
             if self._interrupt_pending:
-                speech_duration_ms = (time.monotonic() - self._speech_start_time) * 1000
+                speech_duration_ms = self._measure_speech_duration_ms(event)
                 self._interrupt_pending = False
 
                 if speech_duration_ms < Config.BACKCHANNEL_MAX_DURATION_MS:
@@ -2113,6 +2169,16 @@ class VobizRealtimeHandler:
             elif code == "response_cancel_not_active":
                 # Benign race: the response finished before our cancel arrived.
                 logger.debug("response.cancel raced response completion (benign)")
+                # The cancel hit nothing, so NO response.done will fire for it —
+                # and response.done is the only place _cancel_requested is
+                # cleared. Left stale it gates the whole NEXT response: its text
+                # is withheld from TTS and, if it is the goodbye, the hangup is
+                # never scheduled and the line sits open in silence. This error
+                # is the unambiguous "cancel missed" signal; clearing on
+                # response.created instead would wipe the flag for the barge-in
+                # recovery cancel above, which deliberately targets a server-VAD
+                # response before its response.created has arrived.
+                self._cancel_requested = False
                 if self._response_create_pending and not self._ai_is_responding:
                     # Our cancel carried a pending re-create but found nothing
                     # active (no response.done will fire it) — fire it now or
@@ -2475,7 +2541,15 @@ class VobizRealtimeHandler:
             self._openers_seen_this_response = True
             stripped = text.strip()
             if stripped and stripped == self._prev_opener and len(stripped) <= 24:
+                # Clear before returning: this path used to skip the
+                # _prev_opener update below, so the string stayed armed forever
+                # and every later turn that matched it was dropped too. When the
+                # whole reply IS the opener that means silence on the caller's
+                # turn, repeating indefinitely with no way to recover. One drop
+                # is the intended de-dup; disarming makes it exactly one.
                 logger.info(f"Skipping repeated opener: {stripped[:30]}")
+                self._prev_opener = ""
+                self._prev_opener_word = ""
                 return
             # Same ack WORD ("சரி,") opening two replies in a row also reads
             # robotic even when the rest differs. Trim the repeated word; the
@@ -2535,6 +2609,10 @@ class VobizRealtimeHandler:
                     except Exception:
                         pass
                     self._external_tts = self._make_external_tts()
+                    # Fresh client — clear any cooldown so the next piece
+                    # actually uses it instead of silently staying on the
+                    # fallback voice for the rest of the call.
+                    self._external_tts_retry_at = 0.0
                 except Exception as e:
                     logger.error(f"TTS worker error: {e}")
                 finally:
@@ -2833,6 +2911,32 @@ class VobizRealtimeHandler:
             if sent:
                 self._record_heard_text(text, sent / 8000.0)
 
+    # How long external TTS stays benched after a failure before it is tried
+    # again. Long enough to ride out a socket blip, short enough that at most a
+    # turn or two of a call is spoken in the fallback voice.
+    _EXTERNAL_TTS_COOLDOWN_S = 20.0
+
+    # Hard bound on ONE external-TTS attempt, kept comfortably under the
+    # _tts_worker's 25s per-piece kill. The provider's own internal timeouts do
+    # not add up to a usable guarantee — Sarvam's worst path is two WS attempts
+    # plus two 3s socket closes plus the REST fallback (~29-34s), which blew
+    # past the worker's kill. That cancellation lands ABOVE this function, so
+    # its except never ran, the OpenAI fallback was never reached, and the
+    # sentence was dropped entirely: 25s of dead air, repeating on the next
+    # piece. Bounding the attempt here keeps the failure INSIDE the try, so the
+    # caller hears the sentence in the fallback voice instead of silence.
+    _EXTERNAL_TTS_DEADLINE_S = 18.0
+
+    def _external_tts_ready(self) -> bool:
+        """True when external TTS is not in its post-failure cooldown."""
+        if not self._external_tts_retry_at:
+            return True
+        if time.monotonic() >= self._external_tts_retry_at:
+            self._external_tts_retry_at = 0.0
+            logger.info(f"{self.tts_provider} TTS cooldown over — retrying it")
+            return True
+        return False
+
     async def _synthesize_and_send(self, text: str, generation: int):
         """Synthesize text and send it only while this response is still current."""
         if not self._vobiz_ws or not self.stream_id:
@@ -2843,11 +2947,17 @@ class VobizRealtimeHandler:
             logger.info(f"Skipping stale TTS text (pre-synthesis): {text[:40]}")
             return
         try:
-            if self._external_tts and self._external_tts_available:
+            if self._external_tts and self._external_tts_ready():
                 if self.tts_provider == "sarvam":
-                    await self._stream_sarvam_and_send(text, generation)
+                    await asyncio.wait_for(
+                        self._stream_sarvam_and_send(text, generation),
+                        timeout=self._EXTERNAL_TTS_DEADLINE_S,
+                    )
                     return
-                audio_bytes = await self._external_tts.synthesize(text)
+                audio_bytes = await asyncio.wait_for(
+                    self._external_tts.synthesize(text),
+                    timeout=self._EXTERNAL_TTS_DEADLINE_S,
+                )
                 if await self._tts_utterance_stale(generation):
                     logger.info(
                         f"Discarding stale {self.tts_provider} synthesis after interruption"
@@ -2876,8 +2986,16 @@ class VobizRealtimeHandler:
                     logger.info(f"TTS sent {len(audio_bytes)} bytes (~{playback_secs:.1f}s) for: {text[:50]}...")
                 return
         except Exception as e:
-            logger.warning(f"{self.tts_provider} TTS failed ({e}), falling back to OpenAI TTS")
-            self._external_tts_available = False
+            # Cooldown, not a permanent kill. This used to latch False for the
+            # rest of the call, so ONE transient socket hiccup meant every
+            # remaining turn came out of OpenAI tts-1/alloy — a Tamil script read
+            # aloud in an English voice, and the streaming path (first audio
+            # ~350ms) replaced by whole-utterance synthesis.
+            logger.warning(
+                f"{self.tts_provider} TTS failed ({e}), falling back to OpenAI TTS "
+                f"for {self._EXTERNAL_TTS_COOLDOWN_S:.0f}s"
+            )
+            self._external_tts_retry_at = time.monotonic() + self._EXTERNAL_TTS_COOLDOWN_S
 
         # OpenAI TTS fallback
         try:
@@ -2989,7 +3107,15 @@ class VobizRealtimeHandler:
     # ── Session restart (on "start over" command) ───────────────────────────
 
     async def _restart_session(self):
-        """Fully reset the OpenAI session to clear conversation history."""
+        """Fully reset the OpenAI session to clear conversation history.
+
+        Runs INSIDE _receive_task (reached via _handle_openai_event), so the very
+        task executing this is the one whose socket is being closed. Once
+        _connect_openai() installs a replacement receive task, this task unwinds
+        into its own `finally` — which must not treat the deliberate close as an
+        unexpected disconnect and tear down the call. That finally detects the
+        swap by comparing the socket it owns against self.openai_ws.
+        """
         logger.info("Restarting OpenAI session (caller requested start over)...")
         try:
             if self.openai_ws:
@@ -3054,6 +3180,23 @@ class VobizRealtimeHandler:
             "transcription_tokens": self._transcription_tokens,
         }
 
+    def _spawn_bg(self, coro) -> asyncio.Task:
+        """Start a one-shot background task that cleanup can actually reach.
+
+        Bare asyncio.create_task() with no stored reference has two failure
+        modes here: the loop keeps only a weak reference, so a task suspended in
+        sleep() can be garbage-collected mid-flight; and _full_cleanup never saw
+        these, so they kept running against closed sockets after the call ended.
+        The first one bites hardest on _resolve_stuck_interrupt — the watchdog
+        added for the 2026-07-10 incident where _interrupt_pending wedged True
+        and muted the agent for 30s. If that task is collected, the watchdog
+        silently never fires and the dead-air bug it guards against returns.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     async def _close_vobiz_on_failure(self, reason: str):
         """Close the Vobiz WebSocket when OpenAI connection fails."""
         logger.error(f"Closing Vobiz stream due to: {reason}")
@@ -3069,9 +3212,13 @@ class VobizRealtimeHandler:
             return
         self._cleanup_started = True
 
-        # Cancel tasks
+        # Cancel tasks. _bg_tasks holds the one-shot sleepers (fillers, gentle
+        # clears, stuck-interrupt watchdogs); without them here a task that woke
+        # after cleanup would write audio into an already-closed Vobiz socket and
+        # mutate playback/echo-gate state on a dead handler.
         for task in [self._receive_task, self._tts_worker_task, self._hangup_task,
-                     self._filler_synth_task, self._listen_bc_task]:
+                     self._filler_synth_task, self._listen_bc_task,
+                     *list(self._bg_tasks)]:
             if task and not task.done():
                 task.cancel()
                 try:

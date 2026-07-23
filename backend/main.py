@@ -165,6 +165,28 @@ for _stream in (sys.stdout, sys.stderr):
 # because no log survived the session). UTF-8 so Tamil transcripts land intact.
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
+
+
+def _resolve_log_level(name: str) -> int:
+    """Map a LOG_LEVEL string to a logging constant.
+
+    Not getattr(logging, name, logging.INFO): for a lowercase level the
+    attribute EXISTS but is the module-level function (logging.info), so the
+    default never fires and basicConfig raises "Level not an integer". Lowercase
+    is the natural thing to write — uvicorn is handed this value further down —
+    so `LOG_LEVEL=info` killed the process at import.
+
+    Restricted to the levels uvicorn also accepts, so one bad value cannot pass
+    here and then crash later inside uvicorn.run instead.
+    """
+    level = logging.getLevelName(str(name or "").strip().upper())
+    if isinstance(level, int) and level in (
+        logging.CRITICAL, logging.ERROR, logging.WARNING,
+        logging.INFO, logging.DEBUG,
+    ):
+        return level
+    return logging.INFO
+
 _file_handler = logging.handlers.RotatingFileHandler(
     os.path.join(_LOG_DIR, "server.log"),
     maxBytes=5 * 1024 * 1024,
@@ -172,7 +194,7 @@ _file_handler = logging.handlers.RotatingFileHandler(
     encoding="utf-8",
 )
 logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
+    level=_resolve_log_level(Config.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -355,8 +377,11 @@ _EDITABLE_KEYS = [
     "ELEVENLABS_VOICE_ID",
     "ELEVENLABS_VOICE_ID_TA",
     "SARVAM_API_KEY",
+    "SARVAM_TTS_MODEL",
     "SARVAM_SPEAKER",
     "SARVAM_SPEAKER_TA",
+    "SARVAM_TTS_TEMPERATURE",
+    "SARVAM_TTS_PACE",
     "VOBIZ_AUTH_ID",
     "VOBIZ_AUTH_TOKEN",
     "VOBIZ_PHONE_NUMBER",
@@ -364,6 +389,55 @@ _EDITABLE_KEYS = [
     "LOGIN_USERNAME",
     "LOGIN_PASSWORD",
 ]
+
+# Sarvam speaker sets are DISJOINT per model — a v2 name on v3 (or vice-versa) is
+# a hard API error on the live call. The settings API validates the model+speaker
+# combo against these before saving so a bad pair can never reach a call.
+_SARVAM_MODEL_SPEAKERS = {
+    "bulbul:v2": {
+        "anushka", "manisha", "vidya", "arya", "abhilash", "karun", "hitesh",
+    },
+    "bulbul:v3": {
+        # Tamil-recommended first (docs), then the rest of the v3 catalog.
+        "ishita", "ritu", "kavitha", "priya", "shreya", "ratan", "rohan", "aditya",
+        "shubh", "neha", "rahul", "pooja", "simran", "kavya", "amit", "dev",
+        "varun", "manan", "sumit", "roopa", "kabir", "aayan", "ashutosh", "advait",
+        "amelia", "sophia", "anand", "tanya", "tarun", "sunny", "mani", "gokul",
+        "vijay", "shruti", "suhani", "mohit", "rehan", "soham", "rupali",
+    },
+}
+
+# Numeric Sarvam knobs: stored as text in .env, but Config holds them as floats
+# (sarvam_tts_service sends them as JSON numbers). Coerce on the runtime setattr,
+# or a UI save would overwrite the float with a string and Sarvam would reject it.
+_SARVAM_NUMERIC_KEYS = {"SARVAM_TTS_TEMPERATURE", "SARVAM_TTS_PACE"}
+
+
+def _validate_sarvam_settings(filtered: dict, current_env: dict) -> str | None:
+    """Return an error string if the model+speaker combo would break a call.
+
+    Both the model and the speakers may arrive in the same PUT (or only one of
+    them, keeping the other from .env), so the effective triple is checked.
+    """
+    model = filtered.get("SARVAM_TTS_MODEL", current_env.get("SARVAM_TTS_MODEL", "bulbul:v3"))
+    if model not in _SARVAM_MODEL_SPEAKERS:
+        return f"Invalid SARVAM_TTS_MODEL '{model}' (must be bulbul:v2 or bulbul:v3)"
+    valid = _SARVAM_MODEL_SPEAKERS[model]
+    for key in ("SARVAM_SPEAKER", "SARVAM_SPEAKER_TA"):
+        spk = filtered.get(key, current_env.get(key, ""))
+        if spk and spk not in valid:
+            return (
+                f"Speaker '{spk}' is not a {model} voice. "
+                f"Pick a {model} speaker (e.g. "
+                f"{'ishita/ritu/ratan/rohan' if model == 'bulbul:v3' else 'karun/anushka/vidya'})."
+            )
+    for key in _SARVAM_NUMERIC_KEYS:
+        if key in filtered:
+            try:
+                float(filtered[key])
+            except ValueError:
+                return f"{key} must be a number (got '{filtered[key]}')"
+    return None
 
 
 def _read_env() -> dict:
@@ -465,15 +539,23 @@ async def update_settings(request: Request):
     if not filtered:
         return JSONResponse({"error": "No valid settings to update"}, status_code=400)
 
-    # Read current env, merge, write back
+    # Read current env first — needed both to merge and to validate the Sarvam
+    # model+speaker combo against whichever of the pair isn't in this PUT.
     env = _read_env()
+
+    sarvam_err = _validate_sarvam_settings(filtered, env)
+    if sarvam_err:
+        return JSONResponse({"error": sarvam_err}, status_code=400)
+
+    # Merge, write back
     env.update(filtered)
     _write_env(env)
 
-    # Reload Config class attributes from updated values
+    # Reload Config class attributes from updated values. Numeric Sarvam knobs
+    # must land on Config as floats, not strings (see _SARVAM_NUMERIC_KEYS).
     for key, value in filtered.items():
         if hasattr(Config, key):
-            setattr(Config, key, value)
+            setattr(Config, key, float(value) if key in _SARVAM_NUMERIC_KEYS else value)
         os.environ[key] = value
 
     logger.info(f"Settings updated: {list(filtered.keys())}")
@@ -1676,5 +1758,10 @@ if __name__ == "__main__":
         # (2026-07-11 06:07, English call) and killed the live Vobiz stream.
         # It also loads half-edited code states. Restart manually after edits.
         reload=False,
-        log_level=Config.LOG_LEVEL.lower()
+        # Route through the same resolver, then back to a name uvicorn accepts.
+        # Passing LOG_LEVEL.lower() raw just moved the crash: uvicorn rejects
+        # anything outside its own set, so a typo died here instead of at import.
+        log_level=logging.getLevelName(
+            _resolve_log_level(Config.LOG_LEVEL)
+        ).lower(),
     )

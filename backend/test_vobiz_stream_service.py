@@ -235,6 +235,10 @@ def test_zero_audio_interrupt_reports_whole_reply_unheard():
         handler._any_real_audio_sent = True
         handler._ai_is_responding = False    # reply completed…
         handler._interrupt_pending = True
+        # 1500ms of REAL speech. The duration comes from the VAD events'
+        # audio_start_ms/audio_end_ms, not wall-clock — wall-clock includes the
+        # silence window the server waits out before emitting speech_stopped.
+        handler._speech_start_audio_ms = 4000
         handler._speech_start_time = time.monotonic() - 1.0
         handler._sent_pieces = []            # …but NO audio ever went out
         handler._unheard_text_this_response = ""
@@ -242,6 +246,7 @@ def test_zero_audio_interrupt_reports_whole_reply_unheard():
 
         await handler._handle_openai_event({
             "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 5500,
         })
 
         injected = [m for m in ws.sent
@@ -294,12 +299,16 @@ def test_barge_in_after_response_done_recovers_unheard_speech():
         handler._is_first_response = False
         handler._ai_is_responding = False           # response already completed
         handler._interrupt_pending = True           # armed at speech_started
-        handler._speech_start_time = time.monotonic() - 1.0  # > backchannel cap
+        # 1500ms of real speech (audio_end_ms − audio_start_ms) — well past the
+        # backchannel cap, so this is ruled a genuine interruption.
+        handler._speech_start_audio_ms = 4000
+        handler._speech_start_time = time.monotonic() - 1.0
         handler._unheard_text_this_response = "முதல்ல உங்க பேரு சொல்லுங்க?"
         handler._heard_text_this_response = "வணக்கம்ங்க, நான் Alex பேசறேன்."
 
         await handler._handle_openai_event({
             "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 5500,
         })
 
         types = [m.get("type") for m in ws.sent]
