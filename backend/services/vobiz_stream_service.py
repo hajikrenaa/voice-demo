@@ -212,6 +212,38 @@ def _colloquialize_ta(text: str) -> str:
     return text
 
 
+# Scripts the model occasionally hallucinates mid-sentence (live 2026-07-24:
+# Chinese "经验" dropped inside a Tamil clause — "பணியாற்றிய经验 இருக்கா?") but
+# which Sarvam ta-IN cannot voice — they surface as a garbled glyph on the call.
+# Strip them right before TTS so a stray foreign token degrades to a dropped word
+# instead of breaking the whole sentence. Tamil (U+0B80–0BFF) and Latin are kept;
+# only clearly-alien scripts are removed. Romanized Tamil is Latin, so it is NOT
+# caught here — that is handled at the prompt (the script-lock in _build_prompt_ta).
+_ALIEN_SCRIPT_RE = re.compile(
+    "["
+    "぀-ヿ"   # Hiragana / Katakana
+    "㐀-䶿"   # CJK extension A
+    "一-鿿"   # CJK unified ideographs
+    "ᄀ-ᇿ"   # Hangul jamo
+    "가-힯"   # Hangul syllables
+    "ऀ-୿"   # Devanagari, Bengali, Gurmukhi, Gujarati, Oriya (pre-Tamil Indic)
+    "ఀ-ൿ"   # Telugu, Kannada, Malayalam (post-Tamil Indic) — Tamil 0B80-0BFF kept
+    "؀-ۿ"   # Arabic
+    "฀-๿"   # Thai
+    "]+"
+)
+
+
+def _strip_alien_scripts(text: str) -> str:
+    """Remove characters from scripts Sarvam can't voice (CJK, non-Tamil Indic…)."""
+    if not text:
+        return text
+    cleaned = _ALIEN_SCRIPT_RE.sub(" ", text)
+    if cleaned != text:
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 # Ack words that open replies. Two consecutive replies opening with the SAME
 # ack word read robotic (live call 2026-07-11: "சரி, ..." × 12 of 17 turns);
 # the repeat is trimmed in _enqueue_tts so the reply starts with substance.
@@ -922,6 +954,13 @@ class VobizRealtimeHandler:
         is_mini = "mini" in (Config.REALTIME_MODEL or "").lower()
         if is_mini:
             lang_lock = (
+                "⚠️ எழுத்து விதி (எல்லாத்துக்கும் மேல முக்கியம்): தமிழ் வார்த்தைகளை "
+                "எப்பவும் தமிழ் எழுத்துலயே சொல்லுங்க. English எழுத்துல (romanized) தமிழ் "
+                "வார்த்தை சொல்லவே கூடாது. ❌ 'Naan Priya pesuren', 'Iddha pathi "
+                "pesalaama', 'senju irukingala' → ✅ 'நான் Priya பேசுறேன்', 'இத பத்தி "
+                "பேசலாமா', 'செஞ்சு இருக்கீங்களா'. English வார்த்தை மட்டும் "
+                "(email, salary, shift, location, Picker, Packer) English எழுத்துல. "
+                "தமிழ், English தவிர வேற எந்த எழுத்தும் (சீன/இந்தி/தெலுங்கு) கூடவே கூடாது.\n"
                 "நீங்க ஒரு உண்மையான, நிதானமான native Tamil professional — live "
                 "ஃபோன் கால்ல பேசறீங்க. சரியான, இயல்பான பேச்சுத் தமிழ்ல மட்டும் "
                 "பேசுங்க — உடைஞ்ச / இலக்கணத் தப்பான வாக்கியம் கூடாது.\n"
@@ -937,6 +976,12 @@ class VobizRealtimeHandler:
             )
         else:
             lang_lock = (
+            "எழுத்து விதி (கண்டிப்பா, எல்லாத்துக்கும் மேல): தமிழ் வார்த்தைகளை எப்பவும் "
+            "தமிழ் எழுத்துலயே பேசுங்க/எழுதுங்க — English எழுத்துல (romanized) தமிழ் "
+            "ஒருபோதும் கூடாது. ❌ 'Naan Priya pesuren', 'Iddha pathi pesalaama' → "
+            "✅ 'நான் Priya பேசுறேன்', 'இத பத்தி பேசலாமா'. daily English வார்த்தைகள் "
+            "(email, salary, shift, location, position மாதிரி) மட்டும் English எழுத்துல. "
+            "தமிழ், English தவிர வேற எந்த எழுத்தும் (சீன/இந்தி/தெலுங்கு போன்றவை) கூடவே கூடாது.\n"
             "நீங்க ஒரு உண்மையான மனிதர் மாதிரி live ஃபோன் கால்ல பேசறீங்க — அழைப்பவரோட "
             "குரலை நேரடியா கேக்கறீங்க.\n"
             "நீங்க யாரு: நிதானமான, அனுபவமுள்ள (matured) native Tamil professional. "
@@ -988,7 +1033,12 @@ class VobizRealtimeHandler:
             "daily English வார்த்தைகள் (name, email, position, experience, salary, notice "
             "period மாதிரி) English-லயே. Script content-ஐ அந்த style-ல இயல்பா சொல்லுங்க — "
             "word-to-word மொழிபெயர்ப்பு வேண்டாம். (content-ஐ மட்டும் பயன்படுத்துங்க; அதன் "
-            "மொழி வழிமுறையை அல்ல.)"
+            "மொழி வழிமுறையை அல்ல.)\n"
+            "எழுத்து — கண்டிப்பா: கீழ உள்ள welcome/கேள்விகள் romanized Tamil-ல (English "
+            "எழுத்துல தமிழ், உ-ம்: 'Naan Priya', 'Iddha pathi pesalaama', 'senju "
+            "irukingala') எழுதி இருந்தா — அதை அப்படியே romanized-ஆ படிக்காதீங்க. அந்த தமிழ் "
+            "வார்த்தைகளை தமிழ் எழுத்துக்கு மாத்தி சொல்லுங்க ('நான் Priya', 'இத பத்தி "
+            "பேசலாமா', 'செஞ்சு இருக்கீங்களா'); English வார்த்தைகள் மட்டும் English எழுத்துல."
         )
 
         if s.get("behaviour"):
@@ -2529,6 +2579,9 @@ class VobizRealtimeHandler:
         chunk is queued separately, so an interrupt's _drain_tts_queue() can stop
         the remaining chunks mid-utterance.
         """
+        # Belt-and-braces: drop any script Sarvam can't voice (CJK/other-Indic the
+        # model sometimes hallucinates) so one stray glyph can't garble the clause.
+        text = _strip_alien_scripts(text)
         if self._language == "ta":
             # Deterministic register fix: the mini model ignores the "no bookish
             # Tamil" rule often enough that the swap happens here, not in prompt.

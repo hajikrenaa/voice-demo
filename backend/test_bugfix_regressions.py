@@ -483,3 +483,42 @@ def test_lowercase_log_level_does_not_crash_startup():
     assert _resolve_log_level("nonsense") == logging.INFO
     assert _resolve_log_level("") == logging.INFO
     assert _resolve_log_level(None) == logging.INFO
+
+
+# ── Tamil TTS text quality (2026-07-24 live-call log) ───────────────────────
+
+
+def test_foreign_script_glyphs_are_stripped_before_tts():
+    """The model dropped Chinese "经验" inside a Tamil clause on a live call;
+    Sarvam ta-IN can't voice it, so it garbled the sentence. Alien scripts must
+    be removed before synthesis while Tamil + Latin + digits survive."""
+    from services.vobiz_stream_service import _strip_alien_scripts
+
+    # The exact live failure: "பணியாற்றிய经验 இருக்கா?" -> word dropped, not garbled.
+    assert _strip_alien_scripts("பணியாற்றிய经验 இருக்கா?") == "பணியாற்றிய இருக்கா?"
+    # Tamil + English loanwords + digits + rupee + em-dash are all preserved.
+    kept = "Morning shift-ல 16,000 முதல் ₹17,000 — ok"
+    assert _strip_alien_scripts(kept) == kept
+    # Other hallucinated scripts (Devanagari here) go too; Tamil stays.
+    assert _strip_alien_scripts("வணக்கம் नमस्ते") == "வணக்கம்"
+    # Tamil is NOT in the alien range — a pure Tamil line is untouched.
+    ta = "உங்க email address சொல்லுங்க"
+    assert _strip_alien_scripts(ta) == ta
+
+
+def test_tamil_prompt_locks_the_writing_system():
+    """Live Tamil calls garbled because the model emitted romanized Tamil
+    ('Naan Priya pesuren') that Sarvam ta-IN mispronounces. The Tamil prompt
+    must carry an explicit Tamil-script lock for BOTH model tiers."""
+    for model in ("gpt-realtime-mini", "gpt-realtime"):
+        original = Config.REALTIME_MODEL
+        Config.REALTIME_MODEL = model
+        try:
+            handler = VobizRealtimeHandler(tts_provider="sarvam", language="ta")
+            handler._script = None
+            prompt = handler._build_prompt_ta()
+        finally:
+            Config.REALTIME_MODEL = original
+        assert "எழுத்து விதி" in prompt, f"no script-lock for {model}"
+        # It names romanized Tamil as the thing to avoid.
+        assert "romanized" in prompt and "pesuren" in prompt, f"weak lock for {model}"
